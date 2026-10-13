@@ -1,7 +1,7 @@
 # AGENTS.md
 
-Windows C 盘清理工具的一个仓库：**单文件、零依赖**的两个外壳（控制台菜单版 + WinForms 窗口版），
-把 10 个 `.ps1` 清理脚本作为资源内嵌进 EXE，首次运行释放到 `%LOCALAPPDATA%\CDiskCleaner\runtime`。
+**CLean** —— Windows C 盘清理工具的一个仓库：**单文件、零依赖**的两个外壳（控制台菜单版 + WinForms 窗口版），
+把 10 个 `.ps1` 清理脚本作为资源内嵌进 EXE，首次运行释放到 `%LOCALAPPDATA%\CLean\runtime`。
 
 安全契约（默认只读、删除类动作先 dry-run 再确认、脚本侧白名单 + 净空间守卫）与全部实测记录见
 [`README.md`](README.md)。
@@ -12,8 +12,8 @@ Windows C 盘清理工具的一个仓库：**单文件、零依赖**的两个外
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-.\src\Build.ps1        # 控制台版 -> C盘清理工具.exe
-.\src\Build.ps1 -Gui   # 窗口版   -> C盘清理工具-GUI.exe
+.\src\Build.ps1        # 控制台版 -> CLean.exe
+.\src\Build.ps1 -Gui   # 窗口版   -> CLean-GUI.exe
                        #            （GuiLauncher.cs + GuiPages.cs + GuiAnims.cs 一起送进 csc）
 ```
 
@@ -27,7 +27,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 ### Issue tracker
 
-GitHub Issues in `lockhhhhh/cdisk-cleaner`, driven with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+GitHub Issues in `lockhhhhh/CLean`, driven with the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

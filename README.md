@@ -1,4 +1,4 @@
-# C 盘清理工具脚本
+# CLean —— Windows C 盘清理工具
 
 一套可复用的 Windows C 盘清理脚本，含安全底座、只读分析、**点到点**清理与空间反升诊断。
 
@@ -18,11 +18,11 @@
 
 | 程序 | 界面 | 源码 | 体积 |
 |---|---|---|---|
-| `C盘清理工具.exe` | 控制台菜单 | `src\Launcher.cs` | 156 KB |
-| `C盘清理工具-GUI.exe` | **WinForms 窗口**（见 1.1；v0.3 颜色主题，v0.4 分页 + 内置扫描器，v0.5 每个功能独立动画、页面不再显示日志） | `src\GuiLauncher.cs` + `GuiPages.cs` + `GuiAnims.cs` | 251 KB |
+| `CLean.exe` | 控制台菜单 | `src\Launcher.cs` | 156 KB |
+| `CLean-GUI.exe` | **WinForms 窗口**（见 1.1；v0.3 颜色主题，v0.4 分页 + 内置扫描器，v0.5 每个功能独立动画、页面不再显示日志） | `src\GuiLauncher.cs` + `GuiPages.cs` + `GuiAnims.cs` | 251 KB |
 
 两者都是**零依赖单文件**：不需要 PowerShell 模块、.NET SDK、联网，**也不需要旁边的 `.ps1` 文件**。
-脚本作为资源内嵌，首次运行释放到 `%LOCALAPPDATA%\CDiskCleaner\runtime\`（可读、可审计）。
+脚本作为资源内嵌，首次运行释放到 `%LOCALAPPDATA%\CLean\runtime\`（可读、可审计）。
 
 ```
   [1] 空间分析               只读，含目录级缓存清单      [6] 开发环境缓存          需确认
@@ -35,17 +35,17 @@
 `[2]` 会先问**清理深度**（标准/深度）与**清理档位**（保守/标准/完整），再跑一遍 dry-run
 打印计划，输入 `y` 回车才真正执行。取消则一个文件都不删。
 
-报告写入 `%LOCALAPPDATA%\CDiskCleaner\runtime\reports\`，菜单 `[r]` 可直接打开。
+报告写入 `%LOCALAPPDATA%\CLean\runtime\reports\`，菜单 `[r]` 可直接打开。
 
 ---
 
-### 1.1 窗口版（`C盘清理工具-GUI.exe`）
+### 1.1 窗口版（`CLean-GUI.exe`）
 
 把上面这套控制台菜单换成窗口，功能、参数、安全契约完全一致。
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────┐
-│ [C:]  C 盘清理工具      [输出日志 • 3][外观 ▾][打开报告目录][刷新][以管理员身份重启] │  白色 header + 1px 分隔线
+│ [C:]  CLean        [输出日志 • 3][外观 ▾][打开报告目录][刷新][以管理员身份重启] │  白色 header + 1px 分隔线
 ├────────────────────────────────────────────────────────────────────────────────────┤
 │ ┌─ C: 系统盘 ──────────────────────────────────[Windows 11 专业版][管理员权限]───┐ │  磁盘卡片
 │ │  104.89 GB 可用                                                                │ │
@@ -73,7 +73,7 @@
 ```
 
 **分页与收纳式功能栏**（v0.4）：10 个功能各占一页，左侧功能栏可折叠（`☰`，状态记在
-`%LOCALAPPDATA%\CDiskCleaner\ui.txt`）：展开时显示序号 + 名称 + 一行说明，折叠后只剩数字，
+`%LOCALAPPDATA%\CLean\ui.txt`）：展开时显示序号 + 名称 + 一行说明，折叠后只剩数字，
 页面因此多出约 230 px 宽度。页内布局固定为「标题 + 模式徽章 / 说明 / 该功能自己的选项 /
 内容区」，删除类页面的按钮就在内容区下方，不再挤在底部一条。
 
@@ -162,7 +162,7 @@ header 上的 `[外观 ▾]` 打开外观菜单，两组单选：
 - **浅色 / 深色 / 跟随系统**：默认 **跟随系统**（跟随 Windows 的"应用"明暗设置）；
 - **强调色**：蓝 · 青 · 绿 · 橙 · 紫 · 玫红（默认蓝），菜单里每项左边画出该强调色的真实色块。
 
-选完立即生效、**不用重启**，并写入 `%LOCALAPPDATA%\CDiskCleaner\theme.txt`：
+选完立即生效、**不用重启**，并写入 `%LOCALAPPDATA%\CLean\theme.txt`：
 
 ```ini
 mode=system      # system | light | dark
@@ -193,7 +193,7 @@ accent=blue      # blue | teal | green | orange | purple | rose
 | 跟随系统 + 运行中把系统切成深色 | 1.5 秒内整窗跟随 | ✓（窗口内浅色背景 0 px） |
 
 > 六种强调色下"强调色像素"都是 **3,867 px** —— 同一套几何、只换色相，这也是"换主题不是重新布局"的旁证。
-> 控制台版（`C盘清理工具.exe`）没有主题功能：它的配色由终端决定。
+> 控制台版（`CLean.exe`）没有主题功能：它的配色由终端决定。
 
 > ⚠️ 自绘 `Button` 派生控件时**不要调用 `base.OnPaint`**：`Button.OnPaint` 会把系统默认外观
 > （背景、文字、焦点框）画在你的自绘内容**之上**，结果是"代码里明明是强调蓝按钮，运行时却是白底黑字"。
@@ -248,17 +248,17 @@ accent=blue      # blue | teal | green | orange | purple | rose
 **审计命令**：
 
 ```powershell
-.\C盘清理工具-GUI.exe --print-plan
+.\CLean-GUI.exe --print-plan
 # 把每个页面在「预演 / 执行」两阶段的真实命令写入（不碰磁盘，随时可跑）
-#   %LOCALAPPDATA%\CDiskCleaner\gui-command-plan.txt   (UTF-8 带 BOM)
+#   %LOCALAPPDATA%\CLean\gui-command-plan.txt   (UTF-8 带 BOM)
 
-.\C盘清理工具-GUI.exe --scan-dirs  C:\Users      # 只读：大目录分析（内置扫描器）
-.\C盘清理工具-GUI.exe --scan-cache C:\Users      # 只读：项目缓存扫描
-# 两者都写 %LOCALAPPDATA%\CDiskCleaner\runtime\reports\scan-cli.json，
+.\CLean-GUI.exe --scan-dirs  C:\Users      # 只读：大目录分析（内置扫描器）
+.\CLean-GUI.exe --scan-cache C:\Users      # 只读：项目缓存扫描
+# 两者都写 %LOCALAPPDATA%\CLean\runtime\reports\scan-cli.json，
 # 用于核对扫描器的体积/文件数与耗时（上面的精度对比就是这么测的）
 ```
 
-**崩溃排查**：界面异常写入 `%LOCALAPPDATA%\CDiskCleaner\gui-crash.log`（含完整堆栈），
+**崩溃排查**：界面异常写入 `%LOCALAPPDATA%\CLean\gui-crash.log`（含完整堆栈），
 同时弹窗告知路径。
 
 #### MVP 边界（窗口里没有暴露的参数）
@@ -290,8 +290,8 @@ accent=blue      # blue | teal | green | orange | purple | rose
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-.\src\Build.ps1                                  # 控制台版 -> C盘清理工具.exe
-.\src\Build.ps1 -Gui                             # 窗口版   -> C盘清理工具-GUI.exe
+.\src\Build.ps1                                  # 控制台版 -> CLean.exe
+.\src\Build.ps1 -Gui                             # 窗口版   -> CLean-GUI.exe
 .\src\Build.ps1 -Gui -OutputName '我的清理工具.exe'
 ```
 
@@ -684,7 +684,7 @@ verdict = NEUTRAL  regressions = simulated-concurrent-writer: -256.0 MB
 | `largedirs-gui.json` / `hidden-gui.json` | 窗口版两个扫描页的结果（内置扫描器写：总字节、文件/目录数、耗时、线程数、每条命中与其体积） |
 | `scan-cli.json` | `--scan-dirs` / `--scan-cache` 命令行扫描的结果（用于核对扫描器精度与速度） |
 
-> 窗口版还有两个**不是报告**的文件，落在 `%LOCALAPPDATA%\CDiskCleaner\`（`reports\` 的上一级）：
+> 窗口版还有两个**不是报告**的文件，落在 `%LOCALAPPDATA%\CLean\`（`reports\` 的上一级）：
 > `theme.txt`（外观设置）与 `ui.txt`（功能栏折叠状态），删掉即回到出厂默认。
 > `gui-command-plan.txt` 与 `gui-crash.log` 也在这一级。
 

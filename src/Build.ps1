@@ -8,7 +8,7 @@
 
   The launcher plus every .ps1 in the project root are compiled into a single
   executable; the scripts travel as embedded resources and are extracted to
-  %LOCALAPPDATA%\CDiskCleaner\runtime at first run.
+  %LOCALAPPDATA%\CLean\runtime at first run.
 
   WHY THE STAGING DIRECTORY: Windows PowerShell 5.1 converts arguments for
   native executables through the console code page. With a UTF-8 console any
@@ -19,8 +19,8 @@
   file cmdlets are Unicode-safe.
 
   Two targets share this build:
-    (default)  Launcher.cs     -> console menu,  C盘清理工具.exe
-    -Gui       GuiLauncher.cs  -> WinForms GUI,  C盘清理工具-GUI.exe
+    (default)  Launcher.cs     -> console menu,  CLean.exe
+    -Gui       GuiLauncher.cs  -> WinForms GUI,  CLean-GUI.exe
 
   Usage:
     .\src\Build.ps1
@@ -52,7 +52,7 @@ if ($Gui) {
 }
 
 if (-not $PSBoundParameters.ContainsKey('OutputName')) {
-    $OutputName = if ($Gui) { 'C盘清理工具-GUI.exe' } else { 'C盘清理工具.exe' }
+    $OutputName = if ($Gui) { 'CLean-GUI.exe' } else { 'CLean.exe' }
 }
 $outPath = Join-Path $root $OutputName
 
@@ -69,7 +69,7 @@ if ($OutputName -match '[<>:"/\\|?*\x00-\x1F]') {
 }
 
 # ASCII name used inside the staging directory
-$stageExe = 'CDiskCleaner.exe'
+$stageExe = 'CLean.exe'
 
 Write-Host '=================================================================='
 Write-Host (" Building single-file {0} launcher" -f $(if ($Gui) { 'GUI' } else { 'console' }))

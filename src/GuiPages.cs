@@ -1,4 +1,4 @@
-// C盘清理工具 · 窗口版 -- pages, fast scanner and side windows.
+// CLean · 窗口版 -- pages, fast scanner and side windows.
 //
 // Split out of GuiLauncher.cs (v0.4) because the window outgrew "one card with a few
 // option rows": every function is now its own page, the two scanning functions own a C#
@@ -96,7 +96,7 @@ internal static class Prefs
     {
         return Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CDiskCleaner", "ui.txt");
+            "CLean", "ui.txt");
     }
 
     internal static void Load()
@@ -1221,7 +1221,7 @@ internal sealed class LogWindow : Form, IThemed
         {
             dlg.Title = "保存输出日志";
             dlg.Filter = "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
-            dlg.FileName = "CDiskCleaner-log-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt";
+            dlg.FileName = "CLean-log-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt";
             if (dlg.ShowDialog(this) != DialogResult.OK) return;
             try
             {
@@ -1833,7 +1833,7 @@ internal abstract class ScanPageBase : ToolPage
             Directory.CreateDirectory(dir);
             StringBuilder sb = new StringBuilder();
             sb.Append("{\r\n");
-            sb.Append("  \"Tool\": \"CDiskCleaner-GUI\",\r\n");
+            sb.Append("  \"Tool\": \"CLean-GUI\",\r\n");
             sb.Append("  \"Page\": \"").Append(Json.Escape(Title)).Append("\",\r\n");
             sb.Append("  \"Time\": \"").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")).Append("\",\r\n");
             sb.Append("  \"Roots\": [");

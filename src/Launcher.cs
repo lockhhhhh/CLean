@@ -1,10 +1,10 @@
-// C盘清理工具 -- single-file launcher.
+// CLean -- single-file launcher.
 //
 // Build:  see src/Build.ps1  (uses the in-box csc.exe, no SDK required)
 // Target: any Windows 10 / 11 with .NET Framework 4.x (present by default).
 //
 // The launcher embeds every .ps1 as a managed resource, extracts them to
-// %LOCALAPPDATA%\CDiskCleaner\runtime on first run (so they stay readable and
+// %LOCALAPPDATA%\CLean\runtime on first run (so they stay readable and
 // auditable), and drives them through a console menu.
 //
 // SAFETY CONTRACT (matches the scripts' own design):
@@ -26,7 +26,7 @@ using System.Text;
 
 internal static class Program
 {
-    private const string AppName = "C 盘清理工具";
+    private const string AppName = "CLean";
     private const string AppVersion = "2.0";
 
     private static string _runtimeDir;
@@ -41,7 +41,7 @@ internal static class Program
 
         _runtimeDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CDiskCleaner", "runtime");
+            "CLean", "runtime");
         _powershell = ResolvePowerShell();
 
         try

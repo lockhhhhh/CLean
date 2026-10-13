@@ -1,10 +1,10 @@
-// C盘清理工具 · 窗口版 -- WinForms launcher for the same PowerShell payload.
+// CLean · 窗口版 -- WinForms launcher for the same PowerShell payload.
 //
 // Build:  .\src\Build.ps1 -Gui      (in-box csc.exe, no SDK required)
 // Target: Windows 10 / 11 with .NET Framework 4.x (present by default).
 //
 // Sibling of Launcher.cs. Same idea - every .ps1 travels embedded in this single
-// EXE, is extracted to %LOCALAPPDATA%\CDiskCleaner\runtime on start, and is then
+// EXE, is extracted to %LOCALAPPDATA%\CLean\runtime on start, and is then
 // driven as a child process - but the console menu is replaced by a window.
 //
 // UI: flat, card based. Everything is drawn in code (no designer, no image assets,
@@ -14,7 +14,7 @@
 // APPEARANCE: every colour the UI paints comes from Theme, a facade over one active
 // Palette. The palette is generated from two knobs - a mode (light / dark / follow
 // Windows) and an accent colour - so a new theme is a table row, not a repaint. The
-// choice is stored in %LOCALAPPDATA%\CDiskCleaner\theme.txt and applied to the live
+// choice is stored in %LOCALAPPDATA%\CLean\theme.txt and applied to the live
 // control tree without restarting (see ApplyPaletteAll / IThemed).
 //
 // SAFETY CONTRACT (identical to the console launcher, and to the scripts' own):
@@ -41,9 +41,9 @@ using System.Windows.Forms;
 
 internal static class Program
 {
-    internal const string AppName = "C 盘清理工具";
+    internal const string AppName = "CLean";
     internal const string AppVersion = "0.5";
-    internal const string AppTagline = "窗口版 v0.5 · 每个功能独立动画 · 页面无日志 · 内置快速扫描器";
+    internal const string AppTagline = "Windows C 盘清理工具 · 窗口版 v0.5 · 每个功能独立动画 · 页面无日志 · 内置快速扫描器";
 
     [STAThread]
     private static int Main(string[] args)
@@ -107,7 +107,7 @@ internal static class Program
 
             string dir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "CDiskCleaner", "runtime", "reports");
+                "CLean", "runtime", "reports");
             Directory.CreateDirectory(dir);
 
             StringBuilder sb = new StringBuilder();
@@ -151,7 +151,7 @@ internal static class Program
 
             string dir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "CDiskCleaner");
+                "CLean");
             Directory.CreateDirectory(dir);
             path = Path.Combine(dir, "gui-command-plan.txt");
             // UTF-8 WITH BOM: this file is meant to be opened in Notepad on a
@@ -171,7 +171,7 @@ internal static class Program
         Report("界面", e.Exception);
     }
 
-    // Writes the full exception to %LOCALAPPDATA%\CDiskCleaner\gui-crash.log and
+    // Writes the full exception to %LOCALAPPDATA%\CLean\gui-crash.log and
     // tells the user the path, so a failure on someone else's machine is
     // diagnosable without a debugger.
     internal static void Report(string where, Exception ex)
@@ -181,7 +181,7 @@ internal static class Program
         {
             string dir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "CDiskCleaner");
+                "CLean");
             Directory.CreateDirectory(dir);
             path = Path.Combine(dir, "gui-crash.log");
             File.AppendAllText(path, String.Format(
@@ -456,10 +456,10 @@ internal static class Theme
     {
         return Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CDiskCleaner", "theme.txt");
+            "CLean", "theme.txt");
     }
 
-    // Two ASCII "key=value" lines (%LOCALAPPDATA%\CDiskCleaner\theme.txt) - easy to
+    // Two ASCII "key=value" lines (%LOCALAPPDATA%\CLean\theme.txt) - easy to
     // read, hand-edit or delete. A missing or damaged file is never an error: the
     // defaults (follow system, blue) simply stand.
     internal static void LoadPreference()
@@ -2479,7 +2479,7 @@ internal sealed class MainForm : Form
     {
         _runtimeDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CDiskCleaner", "runtime");
+            "CLean", "runtime");
         _powershell = ResolvePowerShell();
 
         Log.Append(Program.AppName + "  v" + Program.AppVersion);
@@ -3067,7 +3067,7 @@ internal sealed class MainForm : Form
     internal string DumpPlan()
     {
         StringBuilder sb = new StringBuilder();
-        sb.AppendLine("C 盘清理工具 · 窗口版 -- 命令计划（默认选项下每个按钮会执行什么）");
+        sb.AppendLine("CLean · 窗口版 -- 命令计划（默认选项下每个按钮会执行什么）");
         sb.AppendLine("生成时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
         sb.AppendLine();
         sb.AppendLine("阶段 1 = 点页面底部主按钮执行的命令（绝不带 -Execute，只读或预演）");
@@ -3075,7 +3075,7 @@ internal sealed class MainForm : Form
         sb.AppendLine();
         sb.AppendLine("实际调用方式: PowerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass");
         sb.AppendLine("             -Command \"<设置 UTF-8 输出编码>; & '<脚本路径>' <下列参数>\"");
-        sb.AppendLine("脚本路径 = %LOCALAPPDATA%\\CDiskCleaner\\runtime\\<脚本名>");
+        sb.AppendLine("脚本路径 = %LOCALAPPDATA%\\CLean\\runtime\\<脚本名>");
         sb.AppendLine("两个扫描页（全盘大目录 / 隐藏项目缓存）由内置 C# 扫描器完成，不经过 PowerShell；");
         sb.AppendLine("「隐藏项目缓存」的删除仍然交给 04-Clean-Hidden.ps1，并带 -Paths 与 -Execute。");
         sb.AppendLine();
