@@ -1,0 +1,11 @@
+# 本机清理报告：里面是本机路径、容量、扫描结果，跑一次就变，不入库
+reports/
+
+# 构建产物：由 src/Build.ps1（控制台版）与 src/Build.ps1 -Gui（窗口版）生成，
+# 随时可重建；要发二进制请走 GitHub Releases 而不是提交
+/*.exe
+
+# 运行期 / 临时
+*.log
+.env
+.scratch/
