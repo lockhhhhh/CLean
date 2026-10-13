@@ -42,13 +42,17 @@ using System.Windows.Forms;
 internal static class Program
 {
     internal const string AppName = "CLean";
-    internal const string AppVersion = "0.5";
-    internal const string AppTagline = "Windows C 盘清理工具 · 窗口版 v0.5 · 每个功能独立动画 · 页面无日志 · 内置快速扫描器";
+    // Baked in by src/Build.ps1 from the VERSION file at the repo root.
+    internal const string AppVersion = VersionInfo.Version;
+    // Kept short on purpose: the header's action group is right-docked and the
+    // window can be as narrow as 1060 px, so the tagline must not grow.
+    internal const string AppTagline = "窗口版 v" + VersionInfo.Version + " · 每个功能独立动画 · 页面无日志 · 内置快速扫描器";
 
     [STAThread]
     private static int Main(string[] args)
     {
         HideOwnConsole();
+        UpdateCheck.RunningVersion = AppVersion;
 
         try
         {
@@ -77,6 +81,21 @@ internal static class Program
             // the PowerShell one). Read-only by construction: they only measure.
             if ((args[0] == "--scan-dirs" || args[0] == "--scan-cache") && args.Length >= 2)
                 return ScanCli(args[1], args[0] == "--scan-cache");
+
+            // Same contract as the console build: 0 = up to date, 10 = newer
+            // release exists, 1 = the check itself failed. A windowed process has
+            // nowhere to print, so the verdict also lands in update-cli.json next
+            // to the other machine-readable reports.
+            if (args[0] == "--version" || args[0] == "-version")
+            {
+                Console.WriteLine(AppName + " v" + AppVersion);
+                return 0;
+            }
+            if (args[0] == "--check-update" || args[0] == "-check-update")
+            {
+                bool force = args.Length > 1 && (args[1] == "--force" || args[1] == "-force");
+                return CheckUpdateCli(force);
+            }
         }
 
         try
@@ -89,6 +108,37 @@ internal static class Program
             Report("启动", ex);
             return 1;
         }
+    }
+
+    private static int CheckUpdateCli(bool force)
+    {
+        UpdateInfo info = UpdateCheck.Check(force);
+
+        try
+        {
+            string dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CLean");
+            Directory.CreateDirectory(dir);
+
+            StringBuilder sb = new StringBuilder();
+            sb.Append("{\r\n");
+            sb.Append("  \"Tool\": \"CLean-GUI\",\r\n");
+            sb.Append("  \"Current\": \"").Append(Json.Escape(AppVersion)).Append("\",\r\n");
+            sb.Append("  \"Ok\": ").Append(info.Ok ? "true" : "false").Append(",\r\n");
+            sb.Append("  \"NoRelease\": ").Append(info.NoRelease ? "true" : "false").Append(",\r\n");
+            sb.Append("  \"FromCache\": ").Append(info.FromCache ? "true" : "false").Append(",\r\n");
+            sb.Append("  \"Latest\": \"").Append(Json.Escape(info.Latest == null ? "" : info.Latest)).Append("\",\r\n");
+            sb.Append("  \"IsNewer\": ").Append(info.IsNewer ? "true" : "false").Append(",\r\n");
+            sb.Append("  \"PageUrl\": \"").Append(Json.Escape(info.PageUrl)).Append("\",\r\n");
+            sb.Append("  \"Error\": \"").Append(Json.Escape(info.Error == null ? "" : info.Error)).Append("\"\r\n");
+            sb.Append("}\r\n");
+
+            File.WriteAllText(Path.Combine(dir, "update-cli.json"), sb.ToString(), new UTF8Encoding(true));
+        }
+        catch { /* reporting is best-effort; the exit code is the contract */ }
+
+        if (!info.Ok) return 1;
+        return info.IsNewer ? 10 : 0;
     }
 
     // --scan-dirs <root>  : large-directory analysis over one root
@@ -1748,7 +1798,9 @@ internal sealed class MainForm : Form
 
     internal MainForm()
     {
-        Text = Program.AppName + "  v" + Program.AppVersion;
+        // The Chinese descriptor lives in the title bar rather than the header:
+        // the title bar has room, the header's right-docked action group does not.
+        Text = Program.AppName + " · Windows C 盘清理工具  v" + Program.AppVersion;
         Font = Theme.FontUI;
         BackColor = Theme.Bg;
         StartPosition = FormStartPosition.CenterScreen;
@@ -1886,6 +1938,11 @@ internal sealed class MainForm : Form
         _lblTagline.Font = Theme.FontSmall;
         _lblTagline.AutoSize = true;
         _lblTagline.Location = new Point(74, 50);
+        // The tagline doubles as the update affordance. A sixth header button
+        // would not fit: the action group is right-docked at a fixed width and
+        // the window can shrink to 1060 px.
+        _lblTagline.Cursor = Cursors.Hand;
+        _lblTagline.Click += new EventHandler(OnUpdateClick);
         Role(_lblTagline, "card|muted");
 
         FlowLayoutPanel actions = new FlowLayoutPanel();
@@ -2262,8 +2319,126 @@ internal sealed class MainForm : Form
         ApplyPaletteTree(this);
         UpdateThemeButton();
         UpdateLogButton();
+        UpdateUpdateLabel();
         ApplyTitleBarTheme();
         Theme.RaisePaletteChanged();
+    }
+
+    // ------------------------------------------------------------- update check
+
+    // Non-null once a newer release is known to exist; drives the tagline CTA.
+    private UpdateInfo _updateInfo;
+    private bool _updateBusy;
+
+    // Runs on a thread-pool thread. force == false accepts a fresh cache entry, so
+    // a normal launch only touches the network at most once a day.
+    private void StartUpdateCheck(bool force)
+    {
+        if (_updateBusy) return;
+        _updateBusy = true;
+        UpdateUpdateLabel();
+
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
+        {
+            UpdateInfo info = UpdateCheck.Check(force);
+            try
+            {
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        _updateBusy = false;
+                        ApplyUpdateInfo(info, force);
+                    });
+                }
+            }
+            catch { /* the window went away while we were asking */ }
+        });
+    }
+
+    // announce == true only for a check the user asked for: the automatic startup
+    // check stays quiet unless there is something worth clicking.
+    private void ApplyUpdateInfo(UpdateInfo info, bool announce)
+    {
+        _updateInfo = (info != null && info.Ok && info.IsNewer) ? info : null;
+        UpdateUpdateLabel();
+
+        if (!announce || info == null) return;
+
+        if (!info.Ok)
+        {
+            Info("检查更新失败：" + info.Error + "\r\n\r\n（这只影响更新提示，清理功能不受影响。）");
+            return;
+        }
+        if (info.NoRelease)
+        {
+            Warn("作者还没有在 GitHub 上发布任何版本。");
+            return;
+        }
+        if (!info.IsNewer)
+        {
+            Info("已是最新版本 v" + Program.AppVersion + "。");
+            return;
+        }
+        if (Confirm("发现新版本 v" + info.Latest + "（当前 v" + Program.AppVersion + "）。\r\n\r\n现在打开下载页？"))
+        {
+            OpenUrl(info.PageUrl);
+        }
+    }
+
+    private void UpdateUpdateLabel()
+    {
+        if (_lblTagline == null) return;
+
+        if (_updateBusy)
+        {
+            _lblTagline.Text = "正在检查更新...";
+            _lblTagline.ForeColor = Theme.TextFaint;
+            _tips.SetToolTip(_lblTagline, "正在向 GitHub 查询最新发布");
+            return;
+        }
+        if (_updateInfo != null)
+        {
+            _lblTagline.Text = "发现新版本 v" + _updateInfo.Latest + " —— 点击打开下载页";
+            _lblTagline.ForeColor = Theme.Accent;
+            _tips.SetToolTip(_lblTagline,
+                "当前 v" + Program.AppVersion + "，最新 v" + _updateInfo.Latest + "；点击打开下载页");
+            return;
+        }
+        _lblTagline.Text = Program.AppTagline;
+        _lblTagline.ForeColor = Theme.TextMuted;
+        _tips.SetToolTip(_lblTagline, "点击检查更新");
+    }
+
+    private void OnUpdateClick(object sender, EventArgs e)
+    {
+        if (_updateBusy) return;
+
+        if (_updateInfo != null)
+        {
+            if (Confirm("新版本 v" + _updateInfo.Latest + " 已发布（当前 v" + Program.AppVersion + "）。\r\n\r\n" +
+                        "现在打开下载页？"))
+            {
+                OpenUrl(_updateInfo.PageUrl);
+            }
+            return;
+        }
+        StartUpdateCheck(true);
+    }
+
+    private void OpenUrl(string url)
+    {
+        try { Process.Start(url); }   // ShellExecute: the default browser takes it
+        catch (Exception ex)
+        {
+            Warn("无法打开浏览器：" + ex.Message + "\r\n\r\n请手动访问：\r\n" + url);
+        }
+    }
+
+    private bool Confirm(string message)
+    {
+        return MessageBox.Show(this, message, Program.AppName,
+                   MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
     }
 
     // A control learns its colours in one of two ways: it implements IThemed (it caches
@@ -2486,6 +2661,10 @@ internal sealed class MainForm : Form
         Log.Append("运行目录: " + _runtimeDir);
         Log.Append("解释器  : " + _powershell);
         Log.Append("");
+
+        // Ask GitHub whether a newer release exists. Runs on a thread-pool thread,
+        // never blocks the window, and says nothing at all when it has no news.
+        StartUpdateCheck(false);
 
         try
         {

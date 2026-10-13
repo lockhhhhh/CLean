@@ -27,17 +27,38 @@ using System.Text;
 internal static class Program
 {
     private const string AppName = "CLean";
-    private const string AppVersion = "2.0";
+    // Baked in by src/Build.ps1 from the VERSION file at the repo root.
+    private const string AppVersion = VersionInfo.Version;
 
     private static string _runtimeDir;
     private static string _powershell;
 
     private static int Main(string[] args)
     {
+        UpdateCheck.RunningVersion = AppVersion;
+
         try { Console.OutputEncoding = new UTF8Encoding(false); }
         catch { /* redirected or unsupported console */ }
         try { Console.Title = AppName + " v" + AppVersion; }
         catch { }
+
+        // Headless modes. Handled before anything touches the disk so a script
+        // (or an installer) can ask "what version is this?" cheaply.
+        if (args != null && args.Length > 0)
+        {
+            string a0 = args[0].ToLowerInvariant();
+            if (a0 == "--version" || a0 == "-version")
+            {
+                Console.WriteLine(AppName + " v" + AppVersion);
+                return 0;
+            }
+            if (a0 == "--check-update" || a0 == "-check-update")
+            {
+                bool force = args.Length > 1 &&
+                             (args[1].ToLowerInvariant() == "--force" || args[1].ToLowerInvariant() == "-force");
+                return CheckUpdateCli(force);
+            }
+        }
 
         _runtimeDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -108,6 +129,28 @@ internal static class Program
         }
         if (written == 0)
             throw new Exception("可执行文件中未找到内嵌脚本（打包时未附加 /resource？）");
+    }
+
+    // ------------------------------------------------------------- update
+
+    // Exit codes are scriptable: 0 = up to date, 10 = a newer release exists,
+    // 1 = the check itself failed. --version answers without any network or
+    // disk access at all.
+    private static int CheckUpdateCli(bool force)
+    {
+        Console.WriteLine("  {0} v{1}", AppName, AppVersion);
+        Console.WriteLine("  正在检查 {0} 的最新发布...", UpdateCheck.RepoSlug);
+
+        UpdateInfo info = UpdateCheck.Check(force);
+        Console.WriteLine("  " + info.Display);
+        if (info.FromCache) Console.WriteLine("  （来自本地缓存；加 --force 可强制联网复查）");
+        if (info.Ok && !info.NoRelease)
+        {
+            Console.WriteLine("  下载页: " + info.PageUrl);
+        }
+
+        if (!info.Ok) return 1;
+        return info.IsNewer ? 10 : 0;
     }
 
     // ------------------------------------------------------------- process
@@ -267,6 +310,17 @@ internal static class Program
             Console.WriteLine("  [!] 未以管理员运行：Windows 更新缓存 / Windows\\Temp / 传递优化缓存会被跳过。");
             Console.ResetColor();
         }
+
+        // Local cache only: drawing the menu must never wait on the network. If
+        // an earlier run already learned about a newer release, say so here.
+        UpdateInfo known = UpdateCheck.FromCache();
+        if (known != null && known.Ok && known.IsNewer)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("  [^] 发现新版本 v" + known.Latest + "（当前 v" + AppVersion + "）—— 按 [u] 查看并下载");
+            Console.ResetColor();
+        }
+
         Console.WriteLine("============================================================");
     }
 
@@ -286,10 +340,11 @@ internal static class Program
             Console.WriteLine("  [7] 全盘大目录扫描         只读，定位占空间大户");
             Console.WriteLine("  [8] 隐藏项目缓存扫描       只读，找 node_modules 等");
             Console.WriteLine("  [9] 空间反升诊断           只读，量化「影子副本/占用」等反升原因");
+            Console.WriteLine("  [u] 检查更新               查看是否发布了新版本（只读）");
             Console.WriteLine("  [r] 打开报告目录");
             Console.WriteLine("  [0] 退出");
             Console.WriteLine();
-            Console.Write("  请选择 [0-9/r]: ");
+            Console.Write("  请选择 [0-9/r/u]: ");
 
             string choice = Console.ReadLine();
             if (choice == null) return 0;
@@ -306,6 +361,7 @@ internal static class Program
                 case "7": ActScan(); break;
                 case "8": ActHiddenScan(); break;
                 case "9": ActDiagnose(); break;
+                case "u": ActCheckUpdate(); break;
                 case "r": OpenReports(); break;
                 case "0": return 0;
                 default: break;
@@ -477,6 +533,71 @@ internal static class Program
         Console.WriteLine("    .\\04-Clean-Hidden.ps1 -Execute -Paths '<确切路径>'\n");
         RunScript("04-Clean-Hidden.ps1", "");
         Pause();
+    }
+
+    // ------------------------------------------------------------- update ui
+
+    private static void ActCheckUpdate()
+    {
+        SafeClear();
+        Console.WriteLine("  [u] 检查更新 —— 只读操作，不修改也不删除任何文件\n");
+
+        UpdateInfo info = UpdateCheck.FromCache();
+        if (info != null)
+        {
+            Console.WriteLine("  本地结果（24 小时内查过）: " + info.Display);
+        }
+        else
+        {
+            Console.WriteLine("  本地还没有缓存结果。");
+        }
+
+        Console.WriteLine();
+        Console.Write("  现在联网复查一次？(y 回车 = 联网复查，直接回车 = 结束): ");
+        string a = Console.ReadLine();
+        if (a != null)
+        {
+            a = a.Trim().ToLowerInvariant();
+            if (a == "y" || a == "yes")
+            {
+                Console.WriteLine();
+                Console.WriteLine("  正在联网检查 " + UpdateCheck.RepoSlug + " ...");
+                info = UpdateCheck.Check(true);
+                Console.WriteLine("  " + info.Display);
+            }
+        }
+
+        if (info != null && info.Ok && info.IsNewer)
+        {
+            Console.WriteLine();
+            Console.WriteLine("  下载页: " + info.PageUrl);
+            Console.Write("  现在用浏览器打开下载页？(y 回车 = 打开): ");
+            string b = Console.ReadLine();
+            if (b != null)
+            {
+                b = b.Trim().ToLowerInvariant();
+                if (b == "y" || b == "yes") OpenUrl(info.PageUrl);
+            }
+        }
+        else if (info != null && info.Ok && !info.NoRelease)
+        {
+            Console.WriteLine();
+            Console.WriteLine("  已是最新，无需操作。");
+        }
+        Pause();
+    }
+
+    private static void OpenUrl(string url)
+    {
+        try
+        {
+            Process.Start(url);   // ShellExecute: hands the URL to the default browser
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("  无法打开浏览器: " + ex.Message);
+            Console.WriteLine("  请手动访问: " + url);
+        }
     }
 
     private static void OpenReports()

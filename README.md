@@ -12,14 +12,56 @@
 
 ---
 
+## 零、下载与安装（普通用户）
+
+到 [Releases](https://github.com/lockhhhhh/CLean/releases) 下载 `CLean-Setup-<版本>.exe` 双击安装：
+
+| | |
+|---|---|
+| 安装位置 | `%LOCALAPPDATA%\Programs\CLean`（**按当前用户安装，装的时候不弹 UAC**） |
+| 开始菜单 | 「CLean」窗口版 + 「CLean 控制台」两项；桌面图标可选 |
+| 卸载 | 设置 → 应用 → CLean；或运行安装目录里的 `unins000.exe` |
+| 卸载之后 | `%LOCALAPPDATA%\CLean\`（清理报告、主题、更新缓存）**会保留**，卸载程序不碰用户数据 |
+| 运行权限 | 两个程序都带 `requireAdministrator` 清单，**启动时**才提权（清理系统缓存必须管理员） |
+
+**不想装？** Release 里同时附了两个单文件版本 —— `CLean-GUI.exe`（窗口版）和 `CLean.exe`（控制台版），
+拷到任意 Win10 / Win11 双击就能跑，零依赖、不需要安装。
+
+> ⚠️ **SmartScreen 提示**：本项目没有购买代码签名证书，所以首次运行安装包时 Windows 可能弹出
+> 「Windows 已保护你的电脑」。点「更多信息」→「仍要运行」即可。这是"未签名安装包"的必然结果，
+> 不代表文件有问题。
+
+### 更新检查
+
+窗口版启动时会在后台问一次 GitHub「有没有新版本」，控制台版在主菜单按 `[u]` 查。规则：
+
+- **24 小时缓存**：正常启动一天最多发一次请求，结果存在 `%LOCALAPPDATA%\CLean\update.txt`；
+- **失败静默**：断网 / 超时（5 秒）/ 证书问题都只算"查不到"，绝不弹错、绝不阻塞窗口，**不采集任何数据**；
+- **只提示，不自动安装**：发现新版本后，窗口版把标题下那行说明变成
+  「发现新版本 vX.Y.Z —— 点击打开下载页」，点它用默认浏览器打开 Releases 页；控制台版在菜单顶部提示，
+  按 `[u]` 进详情；
+- 无头查询（给脚本 / CI 用）：
+
+  ```powershell
+  .\CLean.exe --check-update          # 退出码 0 = 已最新，10 = 有新版本，1 = 查询失败
+  .\CLean.exe --check-update --force  # 忽略 24 小时缓存，强制联网复查
+  .\CLean.exe --version               # 只打印版本号；不联网、不落盘、不释放脚本
+  .\CLean-GUI.exe --check-update      # 窗口版同样支持，结果另写一份 update-cli.json
+  ```
+
+---
+
 ## 一、单文件程序（拷到任意 Win10 / Win11 直接双击）
 
 两个外壳，同一个脚本内核（10 个 `.ps1` 内嵌）：
 
 | 程序 | 界面 | 源码 | 体积 |
 |---|---|---|---|
-| `CLean.exe` | 控制台菜单 | `src\Launcher.cs` | 156 KB |
-| `CLean-GUI.exe` | **WinForms 窗口**（见 1.1；v0.3 颜色主题，v0.4 分页 + 内置扫描器，v0.5 每个功能独立动画、页面不再显示日志） | `src\GuiLauncher.cs` + `GuiPages.cs` + `GuiAnims.cs` | 251 KB |
+| `CLean.exe` | 控制台菜单 | `src\Launcher.cs` | 167 KB |
+| `CLean-GUI.exe` | **WinForms 窗口**（见 1.1；v0.3 颜色主题，v0.4 分页 + 内置扫描器，v0.5 每个功能独立动画、页面不再显示日志） | `src\GuiLauncher.cs` + `GuiPages.cs` + `GuiAnims.cs` | 260 KB |
+
+> 版本号从 v1.0.0 起**统一**：以前两个外壳各自计版本（控制台 2.0 / 窗口版 0.5），现在由仓库根目录的
+> `VERSION` 文件统一定义，编译时注入两个程序的可执行文件、程序集元数据和安装包，三处不会跑偏。
 
 两者都是**零依赖单文件**：不需要 PowerShell 模块、.NET SDK、联网，**也不需要旁边的 `.ps1` 文件**。
 脚本作为资源内嵌，首次运行释放到 `%LOCALAPPDATA%\CLean\runtime\`（可读、可审计）。
@@ -29,7 +71,8 @@
   [2] 系统缓存清理           点到点删除 + 净空间保证      [7] 全盘大目录扫描        只读
   [3] 无用缓存发现           只读，扫描未列入清单的缓存   [8] 隐藏项目缓存扫描      只读
   [4] 显卡着色器缓存         自动识别 N 卡 / A 卡        [9] 空间反升诊断          只读
-  [5] C 盘根目录残留         需确认                      [r] 打开报告目录        [0] 退出
+  [5] C 盘根目录残留         需确认                      [u] 检查更新              只读
+                                                          [r] 打开报告目录        [0] 退出
 ```
 
 `[2]` 会先问**清理深度**（标准/深度）与**清理档位**（保守/标准/完整），再跑一遍 dry-run
@@ -309,12 +352,52 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 `-Gui` 额外引用 in-box 的 `System.Windows.Forms.dll` / `System.Drawing.dll` 并改用 `/target:winexe`
 （无控制台窗口），其余流程完全相同。
 
-> ⚠️ **`src\Build.ps1` 必须保存为 UTF-8 带 BOM。** 它含中文输出名，而 Windows PowerShell 5.1 对
-> 无 BOM 的 `.ps1` 按 ANSI(936) 解析 —— 中文会变成带 `?` 的乱码文件名，`Copy-Item` 只会报
-> 「路径中具有非法字符」。构建脚本现在会在开头就拒绝这种名字并直接点明原因。
-> 其余 `.ps1` 保持纯 ASCII，因此不受影响。
+> ⚠️ **`src\Build.ps1` 保持纯 ASCII。** 它以前含中文产物名，而 Windows PowerShell 5.1 会把无 BOM 的
+> `.ps1` 按 ANSI(936) 解析 —— 中文会变成带 `?` 的乱码文件名，`Copy-Item` 只会报「路径中具有非法字符」。
+> v1.0.0 把产物名改成 ASCII（`CLean.exe` / `CLean-GUI.exe`）之后这个坑消失了；脚本仍保留那道检查：
+> `-OutputName` 里一旦出现非法字符就直接点明原因。
 
 `Build.ps1` 会自动收集项目根目录下**所有** `*.ps1` 并逐个校验是否成功内嵌，新增脚本无需改构建脚本。
+
+#### 版本号只有一个来源
+
+仓库根目录的 `VERSION`（内容形如 `1.0.0`）是唯一来源：
+
+- `src\Build.ps1` 读它，生成 `VersionInfo.cs` 到**临时编译目录**（不落库、不会漂移），
+  并写入 `AssemblyVersion` / `FileVersion` / `ProductName` 等程序集元数据；
+- 编译末尾会**回读程序集版本**与 `VERSION` 比对，不一致就直接构建失败；
+- `installer\CLean.iss` 读同一个文件，也支持 `/DMyAppVersion=x.y.z` 覆盖（CI 用它）。
+
+所以「程序里显示的版本」和「安装包 / 更新检查比较的版本」不可能不一致。
+
+#### 打安装包
+
+```powershell
+winget install -e --id JRSoftware.InnoSetup        # 一次性：装 Inno Setup 6
+.\src\Build.ps1; .\src\Build.ps1 -Gui              # 先产出两个 EXE（安装包从这里取）
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\CLean.iss
+# -> dist\CLean-Setup-1.0.0.exe
+```
+
+`installer\CLean.iss` 按**当前用户**安装（`PrivilegesRequired=lowest`，`{autopf}` 因此解析为
+`%LOCALAPPDATA%\Programs\CLean`），带卸载程序、开始菜单两项、可选桌面图标；卸载**不删**
+`%LOCALAPPDATA%\CLean`（用户数据）。
+
+#### 发版
+
+```powershell
+# 1. 改 VERSION（例如 1.0.1）并提交
+# 2. 打 tag 推上去 —— 剩下的交给 GitHub Actions
+git tag v1.0.1
+git push origin main --tags
+```
+
+`.github/workflows/release.yml` 在 `windows-latest` 上执行：读 `VERSION` 并**校验 tag 与之一致**
+（不一致直接失败，免得发出一个版本号对不上的包）→ 用 runner 自带的 `csc.exe` 编两个 EXE
+（**仍然不需要 .NET SDK / NuGet**）→ `choco install innosetup` → 编译安装包 → 发 Release，
+附上安装包**和**两个单文件 EXE。
+
+只推 `main` 不发 Release：同样构建，把安装包当 workflow artifact 传上去，方便先验证。
 
 ---
 
@@ -703,3 +786,13 @@ verdict = NEUTRAL  regressions = simulated-concurrent-writer: -256.0 MB
 
 **明确不碰**：微信聊天数据（`Roaming\Tencent\xwechat`）、`C:\Recovery`、`C:\Windows\Installer`、
 `C:\Windows\System32\*` 全部、下载/桌面/文档等用户目录、浏览器 Cookie 与登录态。
+
+---
+
+## 许可证
+
+[MIT](LICENSE)。
+
+> 这是一个会**真正删除文件**的工具。作者按 MIT 条款「按原样」提供，不对任何数据丢失负责；
+> 工具的安全契约（默认只读、净空间守卫、白名单、先预演后确认）是为了把风险降到最低，
+> 不构成任何形式的担保。

@@ -5,6 +5,10 @@ reports/
 # 随时可重建；要发二进制请走 GitHub Releases 而不是提交
 /*.exe
 
+# 安装包产物（installer/CLean.iss 的输出）与 Inno Setup 的中间目录
+dist/
+installer/stage/
+
 # 运行期 / 临时
 *.log
 .env
