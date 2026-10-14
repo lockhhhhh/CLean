@@ -21,7 +21,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # VERSION is the single source of truth. Refuse to publish a tag that
       # disagrees with it, otherwise the update check would compare against a
@@ -67,7 +67,7 @@ jobs:
           Get-ChildItem dist | Format-Table Name, Length
 
       - name: Upload the installer as a workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: CLean-Setup-${{ env.VERSION }}
           path: dist/CLean-Setup-*.exe
