@@ -1,0 +1,91 @@
+name: release
+
+# Pushing a v* tag builds the two EXEs, compiles the Inno Setup installer and
+# publishes it as a GitHub Release. A manual run (or a push to main) does the
+# same build but stops after uploading the installer as a workflow artifact.
+#
+# No .NET SDK and no NuGet are involved: the EXEs are produced by the csc.exe
+# that ships with .NET Framework on the runner, exactly like a local build.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # VERSION is the single source of truth. Refuse to publish a tag that
+      # disagrees with it, otherwise the update check would compare against a
+      # version the binary does not actually have.
+      - name: Read VERSION and check it against the tag
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "VERSION is not x.y.z: '$version'" }
+          Write-Host "VERSION = $version"
+          if ('${{ github.ref_type }}' -eq 'tag') {
+            $tag = '${{ github.ref_name }}'
+            if ($tag -ne "v$version") {
+              throw "tag '$tag' does not match VERSION ('v$version') - bump VERSION or retag"
+            }
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build the console and the GUI builds
+        shell: pwsh
+        run: |
+          ./src/Build.ps1
+          ./src/Build.ps1 -Gui
+          # Build.ps1 already verified the embedded payload and the baked-in
+          # assembly version; these are the artifacts the installer will carry.
+          Get-ChildItem *.exe | Format-Table Name, Length
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile the installer
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+          )
+          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found in: $($candidates -join ', ')" }
+          Write-Host "ISCC: $iscc"
+          & $iscc "/DMyAppVersion=$env:VERSION" 'installer\CLean.iss'
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Upload the installer as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLean-Setup-${{ env.VERSION }}
+          path: dist/CLean-Setup-*.exe
+          if-no-files-found: error
+
+      # gh is preinstalled on the runner, so no third-party release action is
+      # needed. The standalone EXEs ship alongside the installer: the whole point
+      # of this tool is that it can also be run without installing anything.
+      - name: Publish the GitHub release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(Get-ChildItem 'dist\CLean-Setup-*.exe' | Select-Object -First 1) +
+                    @(Get-ChildItem 'CLean.exe', 'CLean-GUI.exe')
+          foreach ($a in $assets) { Write-Host "asset: $($a.Name)  $($a.Length) bytes" }
+          gh release create $env:GITHUB_REF_NAME @($assets | ForEach-Object { $_.FullName }) `
+            --title "CLean $env:GITHUB_REF_NAME" `
+            --generate-notes `
+            --verify-tag
