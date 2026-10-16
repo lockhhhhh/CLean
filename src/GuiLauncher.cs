@@ -68,7 +68,6 @@ internal static class Program
         // state have to be in place before the first control is constructed, or the
         // window would visibly flash the defaults.
         Theme.LoadPreference();
-        Prefs.Load();
 
         if (args != null && args.Length > 0)
         {
@@ -81,6 +80,10 @@ internal static class Program
             // the PowerShell one). Read-only by construction: they only measure.
             if ((args[0] == "--scan-dirs" || args[0] == "--scan-cache") && args.Length >= 2)
                 return ScanCli(args[1], args[0] == "--scan-cache");
+
+            // The cleanup ledger: every cleanup report already on disk, added up into one
+            // table. Read-only (it opens reports and writes a report, never deletes).
+            if (args[0] == "--ledger" || args[0] == "-ledger") return LedgerCli();
 
             // Same contract as the console build: 0 = up to date, 10 = newer
             // release exists, 1 = the check itself failed. A windowed process has
@@ -150,10 +153,12 @@ internal static class Program
         try
         {
             ScanRun run = new ScanRun(root);
+            // 5 / 50 here mirror 04-Clean-Hidden.ps1's own defaults (-Depth 5, -MinMB 50),
+            // which is what the page's "5 层（快）" and "≥ 50 MB" presets map to.
             ScanOutcome outcome = caches
                 ? FastScan.ScanProjectCaches(new string[] { root },
-                      HiddenCachePage.CacheNames, 5, 50, run)
-                : FastScan.ScanLargeDirs(root, 500L * 1048576L, 200, run);
+                      ScanPage.CacheNames, 5, 50, run)
+                : FastScan.ScanLargeDirs(root, 500L * 1048576L, 200, run, 100);
 
             string dir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -171,6 +176,8 @@ internal static class Program
             sb.Append("  \"Threads\": ").Append(outcome.Threads).Append(",\r\n");
             sb.Append("  \"Denied\": ").Append(outcome.Denied).Append(",\r\n");
             sb.Append("  \"ReparseSkipped\": ").Append(outcome.ReparseSkipped).Append(",\r\n");
+            sb.Append("  \"DepthCapped\": ").Append(outcome.DepthCapped).Append(",\r\n");
+            sb.Append("  \"Cancelled\": ").Append(outcome.Cancelled ? "true" : "false").Append(",\r\n");
             sb.Append("  \"Items\": [\r\n");
             for (int i = 0; i < outcome.Hits.Count; i++)
             {
@@ -178,6 +185,15 @@ internal static class Program
                 sb.Append("    { \"MB\": ").Append((outcome.Hits[i].Bytes / 1048576.0).ToString("0.0"))
                   .Append(", \"Files\": ").Append(outcome.Hits[i].Files)
                   .Append(", \"Path\": \"").Append(Json.Escape(outcome.Hits[i].Path)).Append("\" }");
+            }
+            sb.Append("\r\n  ],\r\n");
+            sb.Append("  \"TopFiles\": [\r\n");
+            for (int i = 0; i < outcome.TopFiles.Count; i++)
+            {
+                if (i > 0) sb.Append(",\r\n");
+                sb.Append("    { \"MB\": ").Append((outcome.TopFiles[i].Bytes / 1048576.0).ToString("0.0"))
+                  .Append(", \"Files\": ").Append(outcome.TopFiles[i].Files)
+                  .Append(", \"Path\": \"").Append(Json.Escape(outcome.TopFiles[i].Path)).Append("\" }");
             }
             sb.Append("\r\n  ]\r\n}\r\n");
 
@@ -187,6 +203,33 @@ internal static class Program
         catch (Exception ex)
         {
             Report("扫描", ex);
+            return 1;
+        }
+    }
+
+    // --ledger : add up every cleanup report already on disk and write reports\ledger.json.
+    // Exists as a CLI for the same reason the scans do - so the number can be reproduced
+    // without a mouse, and so it can be diffed between runs.
+    private static int LedgerCli()
+    {
+        try
+        {
+            string dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CLean", "runtime", "reports");
+
+            string path;
+            int entries = Ledger.Build(dir, out path);
+            if (entries < 0) return 1;
+
+            // entries, not "runs": the ledger lists dry runs and real runs side by side,
+            // and only the real ones count towards CleanupRuns inside the file.
+            Console.WriteLine("ledger entries: " + entries + "  ->  " + path);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Report("账本", ex);
             return 1;
         }
     }
@@ -398,9 +441,12 @@ internal static class Theme
     internal static readonly Font FontMono = new Font("Consolas", 9F);
     internal static readonly Font FontLogo = new Font("Microsoft YaHei UI", 12F, FontStyle.Bold);
 
+    // EndEllipsis on the centred set too: without it a label wider than its control is
+    // drawn straight past the edge instead of being truncated (measured case: the run
+    // button's "运行（只读，不会删除文件）").
     internal const TextFormatFlags CenterFlags =
         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
-        TextFormatFlags.SingleLine | TextFormatFlags.NoPadding;
+        TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding;
 
     internal const TextFormatFlags LeftFlags =
         TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
@@ -502,53 +548,25 @@ internal static class Theme
         return s + " · 强调色 " + _current.AccentName;
     }
 
-    private static string PreferencePath()
-    {
-        return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CLean", "theme.txt");
-    }
-
-    // Two ASCII "key=value" lines (%LOCALAPPDATA%\CLean\theme.txt) - easy to
-    // read, hand-edit or delete. A missing or damaged file is never an error: the
-    // defaults (follow system, blue) simply stand.
+    // The theme lives in the one shared settings file (see Settings in GuiPages.cs), which
+    // also carries the rail state and migrates v1.0's theme.txt / ui.txt on first run.
     internal static void LoadPreference()
     {
-        try
-        {
-            string path = PreferencePath();
-            if (File.Exists(path))
-            {
-                string[] lines = File.ReadAllLines(path);
-                for (int i = 0; i < lines.Length; i++)
-                {
-                    string line = lines[i].Trim();
-                    int eq = line.IndexOf('=');
-                    if (eq <= 0) continue;
+        Settings.Load();
 
-                    string key = line.Substring(0, eq).Trim().ToLowerInvariant();
-                    string val = line.Substring(eq + 1).Trim().ToLowerInvariant();
-                    if (key == "mode" && (val == ModeDark || val == ModeLight || val == ModeSystem)) _mode = val;
-                    else if (key == "accent" && FindAccent(val) != null) _accentId = val;
-                }
-            }
-        }
-        catch { /* unreadable profile: keep the defaults */ }
+        string mode = Settings.Get("mode", ModeSystem);
+        if (mode == ModeDark || mode == ModeLight || mode == ModeSystem) _mode = mode;
+
+        string accent = Settings.Get("accent", "blue");
+        if (FindAccent(accent) != null) _accentId = accent;
+
         Refresh();
     }
 
     internal static void SavePreference()
     {
-        try
-        {
-            string path = PreferencePath();
-            string dir = Path.GetDirectoryName(path);
-            if (!String.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            File.WriteAllText(path,
-                "mode=" + _mode + "\r\naccent=" + _accentId + "\r\n",
-                new UTF8Encoding(false));
-        }
-        catch { /* a read-only profile must not break the UI */ }
+        Settings.Set("mode", _mode);
+        Settings.Set("accent", _accentId);
     }
 
     // ------------------------------------------------------------ palette build
@@ -822,6 +840,10 @@ internal class Pill : Control, IThemed
         _text = text;
         _tone = tone;
         _font = font;
+        // The pill is entirely custom-painted, so the caption has to be carried in Text
+        // as well: that is what accessibility (and UI automation) reads off the window,
+        // and OnPaint never draws Text. Same reasoning as RailButton.
+        Text = text;
         Height = 24;
         AutoSize = false;
         TabStop = false;
@@ -839,6 +861,7 @@ internal class Pill : Control, IThemed
     {
         _text = text;
         _tone = tone;
+        Text = text;
         Width = Measure(text);
         ApplyPalette();
     }
@@ -1228,157 +1251,6 @@ internal class ActivityBar : Control, IThemed
     }
 }
 
-// Owner-drawn action list: number chip, title, one-line role, accent selection.
-internal class ActionListBox : ListBox, IThemed
-{
-    internal string[] Sub = new string[0];
-    private int _hot = -1;
-
-    // WHY THE HOVER REPAINT IS NARROWED *AND* ERASE-FREE
-    // A ListBox is a native comctl32 control that paints its own items, so the
-    // double-buffering styles set below never cover the rows (they only apply to
-    // controls WinForms paints itself). A plain Invalidate() therefore makes the
-    // control erase its whole client area first, which flashed the entire list white
-    // every time the pointer crossed a row. Two changes fix that:
-    //   * only the one or two rows whose hover state actually changed are repainted;
-    //   * that repaint is requested with InvalidateRect(..., bErase: FALSE), so the
-    //     native control does not erase the row first (OnDrawItem fills the row's
-    //     full bounds itself, so there is no stale pixel left behind).
-    // The remaining "erase, then draw" flicker inside a single row is handled at the
-    // window level: MainForm sets WS_EX_COMPOSITED, so the OS composes the window and
-    // its children and a half-painted row is never shown. Painting a row into an
-    // offscreen bitmap and blitting it instead was tried and rejected: GDI text on a
-    // GDI+ bitmap does not go through font smoothing, so the hovered row ended up with
-    // jagged text that did not match the rows painted by the platform.
-    [DllImport("user32.dll")]
-    private static extern bool InvalidateRect(IntPtr hWnd, ref RECT lpRect, bool bErase);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct RECT
-    {
-        internal int Left;
-        internal int Top;
-        internal int Right;
-        internal int Bottom;
-    }
-
-    internal ActionListBox()
-    {
-        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
-        DrawMode = DrawMode.OwnerDrawFixed;
-        ItemHeight = 50;
-        BorderStyle = BorderStyle.None;
-        Font = Theme.FontUI;
-        IntegralHeight = false;
-        DoubleBuffered = true;
-        ApplyPalette();
-    }
-
-    // BackColor/ForeColor are cached on the control, so they have to be re-pushed on a
-    // theme switch; the rows themselves read Theme.* at paint time.
-    public void ApplyPalette()
-    {
-        BackColor = Theme.Card;
-        ForeColor = Theme.Text;
-        Invalidate();
-    }
-
-    protected override void OnMouseMove(MouseEventArgs e)
-    {
-        int i = IndexFromPoint(e.Location);
-        if (i != _hot)
-        {
-            int previous = _hot;
-            _hot = i;
-            RepaintRow(previous);   // drop the old highlight
-            RepaintRow(i);          // and add it to the new row
-        }
-        base.OnMouseMove(e);
-    }
-
-    protected override void OnMouseLeave(EventArgs e)
-    {
-        int previous = _hot;
-        _hot = -1;
-        RepaintRow(previous);
-        base.OnMouseLeave(e);
-    }
-
-    // Repaints one row, without letting the native list box erase it first.
-    private void RepaintRow(int index)
-    {
-        if (index < 0 || index >= Items.Count) return;
-
-        Rectangle row = GetItemRectangle(index);
-        // No handle yet, or the row is scrolled out of view: fall back to a normal
-        // repaint so a hover change is never silently dropped.
-        if (!IsHandleCreated || row.Width <= 0 || row.Height <= 0)
-        {
-            Invalidate();
-            return;
-        }
-
-        RECT rect = new RECT();
-        rect.Left = row.Left;
-        rect.Top = row.Top;
-        rect.Right = row.Right;
-        rect.Bottom = row.Bottom;
-        InvalidateRect(Handle, ref rect, false);   // bErase = FALSE
-    }
-
-    protected override void OnDrawItem(DrawItemEventArgs e)
-    {
-        if (e.Index < 0 || e.Index >= Items.Count) return;
-
-        Graphics g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-
-        using (SolidBrush clear = new SolidBrush(BackColor))
-            g.FillRectangle(clear, e.Bounds);
-
-        DrawRow(g, e.Index, e.Bounds,
-            (e.State & DrawItemState.Selected) == DrawItemState.Selected);
-    }
-
-    // Paints one row in control coordinates (the caller has already laid down the
-    // row's background).
-    private void DrawRow(Graphics g, int index, Rectangle bounds, bool selected)
-    {
-        Rectangle row = new Rectangle(bounds.X, bounds.Top + 3, Width - 1, bounds.Height - 6);
-
-        if (selected)
-        {
-            Theme.FillRound(g, row, 10, Theme.AccentSoft);
-            Theme.FillRound(g, new Rectangle(row.X + 1, row.Y + 8, 3, row.Height - 16), 2, Theme.Accent);
-        }
-        else if (index == _hot)
-        {
-            Theme.FillRound(g, row, 10, Theme.Hover);
-        }
-
-        Rectangle chip = new Rectangle(row.X + 12, row.Y + (row.Height - 26) / 2, 26, 26);
-        Theme.FillRound(g, chip, 9, selected ? Theme.Accent : Theme.ChipBg);
-        TextRenderer.DrawText(g, (index + 1).ToString(), Theme.FontSmallB, chip,
-            selected ? Theme.OnAccent : Theme.TextMuted, Theme.CenterFlags);
-
-        int textX = chip.Right + 12;
-        int textW = Width - textX - 12;
-        if (textW < 20) textW = 20;
-
-        TextRenderer.DrawText(g, Convert.ToString(Items[index]), selected ? Theme.FontUIB : Theme.FontUI,
-            new Rectangle(textX, row.Y + 6, textW, 20),
-            selected ? Theme.AccentDark : Theme.Text, Theme.LeftFlags);
-
-        if (index < Sub.Length)
-        {
-            TextRenderer.DrawText(g, Sub[index], Theme.FontSmall,
-                new Rectangle(textX, row.Y + 26, textW, 17),
-                selected ? Theme.Mix(Theme.AccentDark, Theme.TextMuted, 0.55f) : Theme.TextMuted,
-                Theme.LeftFlags);
-        }
-    }
-}
-
 // ============================================================== appearance menu
 
 // Draws the appearance drop-down with the same palette as the window. A custom
@@ -1517,32 +1389,32 @@ internal sealed class MainForm : Form
             PageAnalyze(),
             PageCacheClean(),
             PageDiscover(),
-            PageCatalog(),
-            PageGpu(),
             PageRoots(),
             PageDev(),
-            new LargeDirsPage(new LargeDirsAnim()),
-            new HiddenCachePage(new CacheTilesAnim()),
+            new ScanPage(new ScanAnim()),
             PageDiagnose()
         };
     }
 
     private ToolPage PageAnalyze()
     {
-        return new ScriptPage("空间分析", "只读 · 磁盘与清单概况",
-            "只读：磁盘概况 + 固定清理清单 + 清单级缓存汇总。运行结果写入报告目录。",
+        ScriptPage page = new ScriptPage("空间分析", "只读 · 磁盘与清单概况",
+            "只读：磁盘概况 + 固定清理清单 + 清单级缓存汇总。结果以表格显示在本页，同时写入报告目录。",
             "01-Analyze.ps1", true,
             delegate(bool execute) { return "-Tag before"; },
             null, null, new AnalyzeAnim());
+        page.ReportTag = "before";
+        page.ReportEmptyHint = "磁盘概况、清单级缓存汇总与大目录排行";
+        return page;
     }
 
     private ToolPage PageCacheClean()
     {
         PillRadio radDepthStd = null, radDepthDeep = null;
         PillRadio radSafe = null, radStd = null, radAggr = null;
-        PillCheck chkExplorer = null, chkRecycle = null;
+        PillCheck chkExplorer = null, chkRecycle = null, chkGpu = null, chkGpuD3d = null;
 
-        return new ScriptPage("系统缓存清理", "预演后确认 · 点到点删除",
+        ScriptPage page = new ScriptPage("系统缓存清理", "预演后确认 · 点到点删除",
             "点到点删除系统缓存。先预演并标出被占用项，确认后才真正删除；逐目标实测净空间，一旦空间反降立即中止。",
             "02-Clean-System.ps1", false,
             delegate(bool execute)
@@ -1552,6 +1424,14 @@ internal sealed class MainForm : Form
                 a.Append(" -Profile ").Append(ProfileName(radSafe, radStd, radAggr));
                 if (chkExplorer != null && chkExplorer.Checked) a.Append(" -RestartExplorer");
                 if (chkRecycle != null && chkRecycle.Checked) a.Append(" -IncludeRecycleBin");
+                // GPU shader caches live in this script's catalogue already (the gpu.*
+                // entries) - the separate "显卡着色器缓存" page only ever duplicated it.
+                // The vendor-neutral (D3D) set only exists when the vendor set is on.
+                if (chkGpu != null && chkGpu.Checked)
+                {
+                    a.Append(" -IncludeGpuShader");
+                    if (chkGpuD3d != null && chkGpuD3d.Checked) a.Append(" -IncludeD3DSCache");
+                }
                 if (execute) a.Append(" -Execute");
                 return a.ToString();
             },
@@ -1586,67 +1466,115 @@ internal sealed class MainForm : Form
                 _tips.SetToolTip(chkExplorer, "explorer 持有缩略图缓存句柄，重启后才能释放这部分空间（explorer 会闪一下）");
                 _tips.SetToolTip(chkRecycle, "把回收站也算进清理范围；清空后无法还原");
                 p.AddOptionRow(ToolPage.MakeRow(null, chkExplorer, chkRecycle));
+
+                chkGpu = new PillCheck("含显卡着色器缓存");
+                chkGpu.Margin = new Padding(0, 0, 18, 0);
+                chkGpuD3d = new PillCheck("含 D3D 着色器缓存");
+                chkGpuD3d.Margin = new Padding(0, 0, 18, 0);
+                chkGpuD3d.Enabled = false;      // the D3D set only exists together with the vendor set
+                chkGpu.CheckedChanged += delegate
+                {
+                    if (chkGpuD3d != null) chkGpuD3d.Enabled = chkGpu.Checked;
+                };
+                _tips.SetToolTip(chkGpu, "自动识别 N 卡 / A 卡，一并清理它们的着色器缓存（-IncludeGpuShader）；"
+                                       + "删除后游戏首次启动会重新编译着色器，可能短暂卡顿");
+                _tips.SetToolTip(chkGpuD3d, "再加 DirectX 的厂商中立着色器缓存（-IncludeD3DSCache）；"
+                                          + "需先勾选「含显卡着色器缓存」");
+                p.AddOptionRow(ToolPage.MakeRow(null, chkGpu, chkGpuD3d));
+
+                // The catalogue used to be a separate read-only page. It is not a function
+                // of its own - it is this page's target list under the profile selected
+                // above - so it is a secondary action here, and its table lands in this
+                // page's own report area (02 writes reports\catalog.json for -ListCatalog).
+                FlatButton btnCatalog = new FlatButton("查看清单（不删除）", Theme.FontUI);
+                btnCatalog.Role = ButtonRole.Ghost;
+                btnCatalog.Size = new Size(140, 32);
+                btnCatalog.Margin = new Padding(0, 0, 8, 0);
+                _tips.SetToolTip(btnCatalog, "按上面的「清理档位」列出这一次会碰到的全部目标"
+                                           + "（含风险级别、文件名模式、时限、是否需要管理员），只读，可导出 CSV");
+                btnCatalog.Click += delegate
+                {
+                    p.UseReportFamily("catalog");
+                    PendingRun run = p.MakeRun();
+                    run.Title = "查看清理清单";
+                    run.ReadOnly = true;        // a listing, never a delete: no confirm strip
+                    run.Confirm = "";
+                    run.Args = delegate(bool execute)
+                    {
+                        return "-ListCatalog -Profile " + ProfileName(radSafe, radStd, radAggr);
+                    };
+                    RunScript(run, false);
+                };
+                p.AddActionButton(btnCatalog);
+
+                // The update caches are the one target Windows refills within minutes
+                // (README 2.3: 5 GB of Delivery Optimization cache came back inside a
+                // minute, with C: used space going UP). Pausing is the only way to make
+                // cleaning them stick, so the action belongs next to the cleaning it
+                // protects - and it goes through the same dry-run-then-confirm contract,
+                // because it writes to the registry.
+                FlatButton btnPause = new FlatButton("暂停更新 7 天", Theme.FontUI);
+                btnPause.Role = ButtonRole.Ghost;
+                btnPause.Size = new Size(118, 32);
+                btnPause.Margin = new Padding(0, 0, 8, 0);
+                _tips.SetToolTip(btnPause, "只改「设置」应用写的那 6 个暂停值"
+                                         + "（HKLM\\…\\WindowsUpdate\\UX\\Settings），不停服务、不建策略键；"
+                                         + "写之前先把原值快照到 reports\\updates-pause-state.json，"
+                                         + "「恢复更新」会精确还原（含删除本工具新建的值）。先预演、确认后才写注册表");
+                btnPause.Click += delegate
+                {
+                    p.UseReportFamily("updates-pause");
+                    PendingRun run = p.MakeRun();
+                    run.Title = "暂停 Windows 更新 7 天";
+                    run.Script = "09-Pause-Updates.ps1";
+                    run.ReportTag = "updates-pause";     // so the strip does not read the cleanup numbers
+                    run.Args = delegate(bool execute) { return "-Days 7" + (execute ? " -Execute" : ""); };
+                    run.Confirm = "预演完成，尚未改动任何设置。现在暂停 Windows 更新 7 天？"
+                                + "（到期后 Windows 会自行恢复）";
+                    RunScript(run, false);
+                };
+                p.AddActionButton(btnPause);
+
+                FlatButton btnResume = new FlatButton("恢复更新", Theme.FontUI);
+                btnResume.Role = ButtonRole.Ghost;
+                btnResume.Size = new Size(88, 32);
+                btnResume.Margin = new Padding(0, 0, 8, 0);
+                _tips.SetToolTip(btnResume, "把暂停状态还原成快照里的值（reports\\updates-pause-state.json）；"
+                                          + "快照里没有的值会被删掉，所以你原本就有的暂停不会被本工具覆盖");
+                btnResume.Click += delegate
+                {
+                    p.UseReportFamily("updates-pause");
+                    PendingRun run = p.MakeRun();
+                    run.Title = "恢复 Windows 更新";
+                    run.Script = "09-Pause-Updates.ps1";
+                    run.ReportTag = "updates-pause";
+                    run.Args = delegate(bool execute) { return "-Resume" + (execute ? " -Execute" : ""); };
+                    run.Confirm = "预演完成，尚未改动任何设置。现在把暂停状态还原为快照里的值？";
+                    RunScript(run, false);
+                };
+                p.AddActionButton(btnResume);
             }, new CacheCleanAnim());
+        page.ReportTag = "system";      // system.json / system.dryrun.json, also read by the confirm strip
+        page.ReportEmptyHint = "每个目标的实测数字（预演为预计释放，执行为净释放）";
+        return page;
     }
 
     private ToolPage PageDiscover()
     {
-        return new ScriptPage("无用缓存发现", "只读 · 扫描未列清单缓存",
-            "只读：扫描未列入清单的缓存目录，按体积排序，并列出本工具不碰的大块残留。",
+        ScriptPage page = new ScriptPage("无用缓存发现", "只读 · 扫描未列清单缓存",
+            "只读：扫描未列入清单的缓存目录，按体积排序，并列出本工具不碰的大块残留。结果以表格显示在本页。",
             "02-Clean-System.ps1", true,
             delegate(bool execute) { return "-Discover -DiscoverMinMB 20"; },
             null, null, new DiscoverAnim());
-    }
-
-    private ToolPage PageCatalog()
-    {
-        PillRadio radSafe = null, radStd = null, radAggr = null;
-        return new ScriptPage("清理清单一览", "只读 · 打印全部目标",
-            "只读：打印全部清理目标（含风险级别、文件名模式、时限、是否需要管理员）。",
-            "02-Clean-System.ps1", true,
-            delegate(bool execute) { return "-ListCatalog -Profile " + ProfileName(radSafe, radStd, radAggr); },
-            null,
-            delegate(ScriptPage p)
-            {
-                radSafe = new PillRadio("保守");
-                radSafe.Margin = new Padding(0, 0, 8, 0);
-                radStd = new PillRadio("标准");
-                radStd.Checked = true;
-                radStd.Margin = new Padding(0, 0, 8, 0);
-                radAggr = new PillRadio("完整");
-                radAggr.Margin = new Padding(0, 0, 8, 0);
-                p.AddOptionRow(ToolPage.MakeRow(ToolPage.MakeRowLabel("清理档位"), radSafe, radStd, radAggr));
-            }, new CatalogAnim());
-    }
-
-    private ToolPage PageGpu()
-    {
-        PillCheck chkD3d = null;
-        return new ScriptPage("显卡着色器缓存", "预演后确认 · N 卡 / A 卡",
-            "自动识别 N 卡 / A 卡。删除后游戏首次启动会重新编译着色器，可能短暂卡顿。",
-            "07-Clean-GpuShaderCache.ps1", false,
-            delegate(bool execute)
-            {
-                StringBuilder a = new StringBuilder();
-                a.Append("-ShowAll");
-                if (chkD3d != null && chkD3d.Checked) a.Append(" -IncludeD3DSCache");
-                if (execute) a.Append(" -Execute");
-                return a.ToString();
-            },
-            null,
-            delegate(ScriptPage p)
-            {
-                chkD3d = new PillCheck("含 D3D 着色器缓存");
-                chkD3d.Margin = new Padding(0, 0, 18, 0);
-                _tips.SetToolTip(chkD3d, "同时清理 DirectX 着色器缓存（-IncludeD3DSCache）");
-                p.AddOptionRow(ToolPage.MakeRow(null, chkD3d));
-            }, new GpuAnim());
+        page.ReportTag = "discover";
+        page.ReportEmptyHint = "未列清单的缓存目录与大块残留";
+        return page;
     }
 
     private ToolPage PageRoots()
     {
         PillCheck chkWinRE = null, chkHls = null, chkKuGou = null;
-        return new ScriptPage("C盘根目录残留", "预演后确认 · HLS / P2P / 回滚数据",
+        ScriptPage page = new ScriptPage("C盘根目录残留", "预演后确认 · HLS / P2P / 回滚数据",
             "HLS 视频分片缓存 / 酷狗 P2P 缓存 / $WinREAgent 更新回滚数据。删除回滚数据后无法回退该次更新。",
             "06-Clean-RootLeftovers.ps1", false,
             delegate(bool execute)
@@ -1684,12 +1612,15 @@ internal sealed class MainForm : Form
                 _tips.SetToolTip(chkKuGou, "酷狗 P2P 缓存（C:\\KuGou\\Temp\\tp2p）");
                 p.AddOptionRow(ToolPage.MakeRow(null, chkWinRE, chkHls, chkKuGou));
             }, new RootsAnim());
+        page.ReportTag = "rootleftovers";
+        page.ReportEmptyHint = "每个根目录目标的实测数字";
+        return page;
     }
 
     private ToolPage PageDev()
     {
         PillCheck chkAggr = null;
-        return new ScriptPage("开发环境缓存", "预演后确认 · npm / pip / go",
+        ScriptPage page = new ScriptPage("开发环境缓存", "预演后确认 · npm / pip / go",
             "npm / pnpm / pip / yarn / go 等包管理器缓存，删除后需要重新下载依赖。",
             "03-Clean-Dev.ps1", false,
             delegate(bool execute)
@@ -1707,13 +1638,16 @@ internal sealed class MainForm : Form
                 _tips.SetToolTip(chkAggr, "连全局 npm / pip / yarn 缓存一并清理，下次构建需要重新下载依赖（-Aggressive）");
                 p.AddOptionRow(ToolPage.MakeRow(null, chkAggr));
             }, new DevAnim());
+        page.ReportTag = "dev";
+        page.ReportEmptyHint = "每个开发缓存的实测数字";
+        return page;
     }
 
     private ToolPage PageDiagnose()
     {
         PillCheck chkDeep = null;
-        return new ScriptPage("空间反升诊断", "只读 · 量化反升原因",
-            "只读：量化「为什么清完反而更满」—— 卷影副本写时复制、句柄未释放、缓存再生等。",
+        ScriptPage page = new ScriptPage("空间反升诊断", "只读 · 量化反升原因",
+            "只读：量化「为什么清完反而更满」—— 卷影副本写时复制、句柄未释放、缓存再生等。结果以表格显示在本页。",
             "08-Diagnose-SpaceGrowth.ps1", true,
             delegate(bool execute)
             {
@@ -1726,7 +1660,39 @@ internal sealed class MainForm : Form
                 chkDeep.Margin = new Padding(0, 0, 18, 0);
                 _tips.SetToolTip(chkDeep, "更慢、更细的采样（-Deep），用于定位顽固的空间反升");
                 p.AddOptionRow(ToolPage.MakeRow(null, chkDeep));
+
+                // The ledger answers the same question as this page, but over time instead
+                // of right now: "I cleaned 3 GB - is it still there?" The scripts have been
+                // writing the numbers into their reports all along; this adds them up.
+                FlatButton btnLedger = new FlatButton("清理账本（历次战果与之后的变化）", Theme.FontUI);
+                btnLedger.Role = ButtonRole.Ghost;
+                btnLedger.Size = new Size(300, 32);
+                _tips.SetToolTip(btnLedger, "把 reports\\ 里每一次清理的实测净释放按时间列成一张表，"
+                                          + "并给出 C 盘可用空间相对每次运行结束时的变化。只读：只读报告、只写报告");
+                btnLedger.Click += delegate
+                {
+                    string dir = System.IO.Path.Combine(_runtimeDir, "reports");
+                    string path;
+                    int runs = Ledger.Build(dir, out path);
+                    if (runs < 0)
+                    {
+                        Warn("账本生成失败：无法写入 " + dir);
+                        return;
+                    }
+
+                    p.UseReportFamily("ledger");
+                    p.ReloadReport();
+                    Info(runs == 0
+                        ? "账本已生成，但 reports\\ 里还没有任何清理报告（先跑一次预演或清理）。\r\n\r\n" + path
+                        : "账本已生成：" + runs + " 条记录。\r\n\r\n" + path
+                          + "\r\n\r\n「之后的变化」是 C 盘可用空间与该次运行结束时之差（卷自身的计数器）；"
+                          + "Windows 更新、浏览器和页面文件也会改动它，所以它只说明变了多少，不说明是谁改的。");
+                };
+                p.AddOptionRow(ToolPage.MakeRow(btnLedger));
             }, new DiagnoseAnim());
+        page.ReportTag = "spacegrowth";
+        page.ReportEmptyHint = "各项反升机制的实测数字";
+        return page;
     }
 
     private static string ProfileName(PillRadio safe, PillRadio std, PillRadio aggr)
@@ -1839,6 +1805,15 @@ internal sealed class MainForm : Form
         _logBadge.Interval = 700;
         _logBadge.Tick += delegate { UpdateLogButton(); };
 
+        // Resolved BEFORE the layout runs, because the layout builds every page and a
+        // page may need these while it is being constructed - the report pages read the
+        // report file the previous run wrote, and Path.Combine(null, ...) threw, which
+        // took the whole window down at startup.
+        _runtimeDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CLean", "runtime");
+        _powershell = ResolvePowerShell();
+
         BuildLayout();
 
         // Paint everything from the active palette before the window is shown. The same
@@ -1849,6 +1824,62 @@ internal sealed class MainForm : Form
         Load += new EventHandler(OnLoad);
         Shown += new EventHandler(OnShown);
         FormClosing += new FormClosingEventHandler(OnFormClosing);
+
+        // Drag a folder onto the window to analyse that folder instead of the whole disk.
+        // The handlers go on the WHOLE control tree, not just the form: WinForms delivers
+        // a drop to the deepest control under the cursor, so a card or a list that has not
+        // opted in swallows the drop and the form never hears about it.
+        EnableFolderDrop(this);
+    }
+
+    // ------------------------------------------------------------- folder drop
+
+    private void EnableFolderDrop(Control root)
+    {
+        root.AllowDrop = true;
+        root.DragEnter += new DragEventHandler(OnAnyDragEnter);
+        root.DragDrop += new DragEventHandler(OnAnyDragDrop);
+        for (int i = 0; i < root.Controls.Count; i++) EnableFolderDrop(root.Controls[i]);
+    }
+
+    private static string DroppedFolder(DragEventArgs e)
+    {
+        try
+        {
+            if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return null;
+            string[] items = (string[])e.Data.GetData(DataFormats.FileDrop);
+            if (items == null || items.Length == 0) return null;
+
+            string p = items[0];
+            if (Directory.Exists(p)) return p;
+
+            // A dropped FILE means its folder - that is the thing with a size worth seeing.
+            string dir = Path.GetDirectoryName(p);
+            return (!String.IsNullOrEmpty(dir) && Directory.Exists(dir)) ? dir : null;
+        }
+        catch { return null; }
+    }
+
+    private void OnAnyDragEnter(object sender, DragEventArgs e)
+    {
+        e.Effect = DroppedFolder(e) != null ? DragDropEffects.Copy : DragDropEffects.None;
+    }
+
+    private void OnAnyDragDrop(object sender, DragEventArgs e)
+    {
+        string folder = DroppedFolder(e);
+        if (folder == null) return;
+
+        for (int i = 0; i < _pages.Length; i++)
+        {
+            ScanPage scan = _pages[i] as ScanPage;
+            if (scan == null) continue;
+
+            ShowPage(i);
+            Log.Append("[拖放] 只分析这个文件夹：" + folder);
+            scan.ScanFolder(folder);
+            return;
+        }
     }
 
     // ------------------------------------------------------------- layout
@@ -1906,7 +1937,8 @@ internal sealed class MainForm : Form
         Controls.Add(BuildConfirmStrip());
         Controls.Add(BuildActionBar());
 
-        BuildPages();
+        // CreatePages() builds the page array itself - building it here as well threw a
+        // whole set of ToolPage objects (and their tooltips) away unused.
         CreatePages();
         ShowPage(1);            // 系统缓存清理, the common case
     }
@@ -2079,7 +2111,7 @@ internal sealed class MainForm : Form
     {
         _rail = new Panel();
         _rail.Dock = DockStyle.Left;
-        _rail.Width = Prefs.RailExpanded ? 292 : 64;
+        _rail.Width = Settings.RailExpanded ? 292 : 64;
         _rail.Padding = new Padding(6, 8, 6, 8);
         Role(_rail, "card");
 
@@ -2135,13 +2167,13 @@ internal sealed class MainForm : Form
 
     private void ToggleRail()
     {
-        Prefs.RailExpanded = !Prefs.RailExpanded;
+        Settings.RailExpanded = !Settings.RailExpanded;
         ApplyRailState();
     }
 
     private void ApplyRailState()
     {
-        bool expanded = Prefs.RailExpanded;
+        bool expanded = Settings.RailExpanded;
         _rail.Width = expanded ? 292 : 64;
         _btnRailToggle.Text = expanded ? "☰  折叠功能栏" : "☰";
         if (_railButtons != null)
@@ -2149,7 +2181,7 @@ internal sealed class MainForm : Form
             for (int i = 0; i < _railButtons.Length; i++)
             {
                 _railButtons[i].SetCollapsed(!expanded);
-                _railButtons[i].Width = Math.Max(40, _railItems.ClientSize.Width - 6 - (expanded ? 0 : 0));
+                _railButtons[i].Width = Math.Max(40, _railItems.ClientSize.Width - 6);
                 _railButtons[i].Invalidate();
             }
         }
@@ -2222,7 +2254,7 @@ internal sealed class MainForm : Form
         Role(buttons, "card");
 
         _btnRun = new FlatButton("开始预演（不删除文件）", Theme.FontUIB);
-        _btnRun.Size = new Size(224, 40);
+        _btnRun.Size = new Size(232, 40);
         _btnRun.Role = ButtonRole.Primary;
         _btnRun.Radius = 9;
         _btnRun.Margin = new Padding(0);
@@ -2652,11 +2684,6 @@ internal sealed class MainForm : Form
 
     private void OnLoad(object sender, EventArgs e)
     {
-        _runtimeDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CLean", "runtime");
-        _powershell = ResolvePowerShell();
-
         Log.Append(Program.AppName + "  v" + Program.AppVersion);
         Log.Append("运行目录: " + _runtimeDir);
         Log.Append("解释器  : " + _powershell);
@@ -2668,8 +2695,10 @@ internal sealed class MainForm : Form
 
         try
         {
-            int written = ExtractScripts();
-            Log.Append("已释放 " + written + " 个脚本组件（可直接审计）。");
+            int failed;
+            int written = ExtractScripts(out failed);
+            Log.Append("已释放 " + written + " 个脚本组件（可直接审计）。"
+                + (failed > 0 ? " 另有 " + failed + " 个失败，详见上面几行。" : ""));
         }
         catch (Exception ex)
         {
@@ -2710,39 +2739,106 @@ internal sealed class MainForm : Form
         return "powershell.exe";
     }
 
-    private int ExtractScripts()
+    private string _lastExtractError = "";
+
+    // Writes the embedded .ps1 files to the runtime directory.
+    //
+    // WHY IT TOLERATES FAILURES: this used to abort the whole loop on the first bad file and
+    // throw, which popped a modal error at startup AND left the runtime copies half-updated -
+    // so the feature belonging to the file that failed was broken until the next launch. One
+    // transient "access denied" (antivirus scanning a freshly written .ps1 that touches
+    // HKLM, or a handle that has not been released yet) must not cost the other ten scripts.
+    // A failed file is retried once and then logged; only a total failure throws.
+    private int ExtractScripts(out int failed)
     {
         Directory.CreateDirectory(_runtimeDir);
         Assembly asm = Assembly.GetExecutingAssembly();
         string[] names = asm.GetManifestResourceNames();
         int written = 0;
+        failed = 0;
 
         for (int i = 0; i < names.Length; i++)
         {
             string name = names[i];
             if (!name.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase)) continue;
 
-            string target = Path.Combine(_runtimeDir, name);
-            Stream src = null;
-            FileStream dst = null;
-            try
-            {
-                src = asm.GetManifestResourceStream(name);
-                if (src == null) continue;
-                dst = new FileStream(target, FileMode.Create, FileAccess.Write);
-                src.CopyTo(dst);
-                written++;
-            }
-            finally
-            {
-                if (dst != null) dst.Dispose();
-                if (src != null) src.Dispose();
-            }
+            if (WriteScript(asm, name)) { written++; continue; }
+
+            // One retry: a scanner holding the file it just saw appear releases it quickly.
+            System.Threading.Thread.Sleep(250);
+            if (WriteScript(asm, name)) { written++; continue; }
+
+            failed++;
+            Log.Append("[!] 释放失败：" + name + " —— " + _lastExtractError);
+            Log.Append("    该功能的脚本可能不是最新版。");
+            Log.Append("    处理办法：结束占用它的进程，或删掉 " + Path.Combine(_runtimeDir, name));
+            Log.Append("    后重启本程序（下次启动会重新释放全部脚本）。");
         }
 
+        // Both failure shapes matter and neither may pass silently: nothing embedded at all
+        // (a build that forgot /resource) would otherwise look like success here and only
+        // surface later as "脚本不存在" from every feature.
         if (written == 0)
-            throw new Exception("可执行文件中未找到内嵌脚本（打包时未附加 /resource？）");
+            throw new Exception(failed > 0
+                ? "没有任何内嵌脚本能释放到 " + _runtimeDir + "：" + _lastExtractError
+                : "可执行文件中未找到内嵌脚本（打包时未附加 /resource？）");
         return written;
+    }
+
+    private bool WriteScript(Assembly asm, string name)
+    {
+        string target = Path.Combine(_runtimeDir, name);
+        if (WriteTo(asm, name, target)) return true;
+
+        // Fallback: delete and write it fresh.
+        //
+        // WHY THIS IS NOT PARANOIA - measured on a real machine: a runtime copy can become
+        // permanently un-overwritable while a fresh create of the SAME path succeeds. That
+        // file was not read-only (the flag was clear), its ACL was identical to its ten
+        // working siblings, nothing held it open, and a plain console probe wrote it happily
+        // - yet every launch of the GUI failed on that one file with "访问被拒绝", which is
+        // exactly the startup dialog users were seeing. Deleting it let the next launch write
+        // it correctly, so removing it first turns a permanent failure into a one-off.
+        try { File.Delete(target); } catch { }
+        if (File.Exists(target)) return false;      // deletion denied too: report honestly
+        return WriteTo(asm, name, target);
+    }
+
+    private bool WriteTo(Assembly asm, string name, string target)
+    {
+        Stream src = null;
+        FileStream dst = null;
+        try
+        {
+            src = asm.GetManifestResourceStream(name);
+            if (src == null) { _lastExtractError = "内嵌资源缺失"; return false; }
+
+            // A read-only copy is the other reason this fails, and FileMode.Create alone
+            // reports it as "访问被拒绝" without saying why. It is our own file, so clearing
+            // the flag is safe. NOTE: File.Delete on a read-only file is denied too, so
+            // delete-and-replace is not a way around this - the attribute has to go.
+            try
+            {
+                FileAttributes at = File.GetAttributes(target);
+                if ((at & FileAttributes.ReadOnly) != 0)
+                    File.SetAttributes(target, at & ~FileAttributes.ReadOnly);
+            }
+            catch { /* not there yet, or not ours to change: the write below reports it */ }
+
+            dst = new FileStream(target, FileMode.Create, FileAccess.Write);
+            src.CopyTo(dst);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _lastExtractError = ex.Message;
+            return false;
+        }
+        finally
+        {
+            if (dst != null) dst.Dispose();
+            if (src != null) src.Dispose();
+        }
     }
 
     // ------------------------------------------------------------- system info
@@ -2915,21 +3011,6 @@ internal sealed class MainForm : Form
         catch (Exception ex)
         {
             Warn("无法打开资源管理器: " + ex.Message);
-        }
-    }
-
-    // Hand a big folder over to the cleanup page: that page owns deletion, and only for
-    // paths its own script accepts.
-    internal void HandOffToHiddenPage(string path)
-    {
-        for (int i = 0; i < _pages.Length; i++)
-        {
-            HiddenCachePage hidden = _pages[i] as HiddenCachePage;
-            if (hidden == null) continue;
-
-            ShowPage(i);
-            hidden.AcceptHandOff(path);
-            return;
         }
     }
 
@@ -3155,6 +3236,63 @@ internal sealed class MainForm : Form
         catch { /* form already gone */ }
     }
 
+    // What the dry run measured, read back from the report the script wrote
+    // (<tag>.dryrun.json). Rows carry EstimatedMB (how much a real run should release -
+    // the scripts predict lock contention, they no longer sum file lengths) and
+    // LockedPredicted (items another process holds open, so they free nothing).
+    // Returns null whenever the report is missing or unreadable: the strip then falls
+    // back to its plain sentence rather than showing a number nobody verified.
+    private string DryRunSummary(PendingRun run)
+    {
+        if (run == null || String.IsNullOrEmpty(run.ReportTag)) return null;
+        try
+        {
+            string path = Path.Combine(_runtimeDir, "reports", run.ReportTag + ".dryrun.json");
+            JNode root = JsonRead.LoadFile(path);
+            if (root == null) return null;
+
+            // Only a cleanup report carries a free-space measurement. The update-pause
+            // action is a settings change, and telling the user it would "release 0 MB"
+            // would be a lie dressed up as a measurement.
+            if (root.Get("FreeBeforeGB") == null) return null;
+
+            JNode rows = root.Get("Rows");
+            if (rows == null || rows.Count == 0) return null;
+
+            double predicted = 0;
+            int locked = 0;
+            int withContent = 0;
+            for (int i = 0; i < rows.Count; i++)
+            {
+                JNode r = rows.At(i);
+                if (r == null) continue;
+
+                JNode items = r.Get("SelectedItems");
+                if (items == null || items.AsDouble(0) <= 0) continue;
+                withContent++;
+
+                JNode est = r.Get("EstimatedMB");
+                if (est == null) est = r.Get("FreedMB");
+                if (est != null) predicted += est.AsDouble(0);
+
+                JNode lk = r.Get("LockedPredicted");
+                if (lk != null) locked += (int)Math.Round(lk.AsDouble(0));
+            }
+
+            if (withContent == 0)
+                return "预演结果：这些目标当前没有可删除的内容（0 MB）。";
+
+            string s = String.Format("预演结果：预计可释放 {0:N1} MB，涉及 {1} 个目标", predicted, withContent);
+            if (locked > 0)
+                s += String.Format("；其中 {0} 项被其他程序占用，不会真的释放空间", locked);
+            return s + "。";
+        }
+        catch
+        {
+            return null;    // a summary is a bonus; it must never break the confirm strip
+        }
+    }
+
     private void FinishRun(int code)
     {
         PendingRun run = _running;
@@ -3207,9 +3345,14 @@ internal sealed class MainForm : Form
         if (!cancelled && code == 0 && !run.ReadOnly)
         {
             _pending = run;
-            _lblConfirm.Text = run.Confirm.Length > 0
+            string sentence = run.Confirm.Length > 0
                 ? run.Confirm
                 : ("预演完成，尚未删除任何文件。现在执行「" + run.Title + "」？");
+            // The strip is the last thing read before the only destructive click in the
+            // program, so it carries what the dry run actually measured - taken from the
+            // report the dry run wrote, not re-derived from the log text.
+            string measured = DryRunSummary(run);
+            _lblConfirm.Text = measured == null ? sentence : (measured + "\r\n" + sentence);
             _confirmStrip.Visible = true;
             SetBusy(false, "等待确认：预演已完成，未删除任何文件");
         }

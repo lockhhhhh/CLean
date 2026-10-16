@@ -254,64 +254,6 @@ internal sealed class DiscoverAnim : AnimBase
     }
 }
 
-// =========================================== 4. 清单/列表：纸张逐行打印出来
-
-internal sealed class CatalogAnim : AnimBase
-{
-    protected override void DrawMotif(Graphics g, Rectangle box, int frame, bool running)
-    {
-        Rectangle page = new Rectangle(box.X + 13, box.Y + 4, box.Width - 26, box.Height - 8);
-        Sq(g, page, 4, Fade(Theme.ConsoleBd, 210));
-
-        const int lines = 6;
-        int reveal = (frame / 7) % (lines + 6);
-        for (int i = 0; i < lines && i < reveal; i++)
-        {
-            int w = page.Width - 12 - ((i % 3) * 8);
-            bool current = (i == reveal - 1);
-            Sq(g, new Rectangle(page.X + 6, page.Y + 6 + i * 9, Math.Max(6, w), 4), 1,
-                Fade(Theme.Accent, current ? 240 : 120));
-        }
-        if (reveal < lines)
-        {
-            int y = page.Y + 6 + reveal * 9;
-            Sq(g, new Rectangle(page.X + 6, y, 5, 4), 1, Fade(Theme.Accent, 255));
-        }
-    }
-}
-
-// ====================================== 5. 显卡着色器缓存：旋转线框 + 顶点脉冲
-
-internal sealed class GpuAnim : AnimBase
-{
-    protected override void DrawMotif(Graphics g, Rectangle box, int frame, bool running)
-    {
-        int cx = box.X + 34;
-        int cy = box.Y + 32;
-        double rot = frame * 0.045;
-        int r = 24;
-
-        Point[] pts = new Point[3];
-        for (int i = 0; i < 3; i++)
-        {
-            double a = rot + i * 2.0 * Math.PI / 3.0;
-            pts[i] = new Point(cx + (int)(Math.Cos(a) * r), cy + (int)(Math.Sin(a) * r * 0.85));
-        }
-
-        using (Pen p = new Pen(Fade(Theme.Accent, running ? 240 : 170), 1.8f))
-            g.DrawPolygon(p, pts);
-        using (Pen p = new Pen(Fade(Theme.ConsoleFg, 60), 1f))
-            g.DrawEllipse(p, cx - 11, cy - 9, 22, 18);
-
-        for (int i = 0; i < 3; i++)
-        {
-            int pulse = 4 + (int)(2.5 * (1 + Math.Sin(frame * 0.12 + i)));
-            Dot(g, pts[i].X - pulse / 2, pts[i].Y - pulse / 2, pulse, Fade(Theme.Accent, 235));
-        }
-        Sq(g, new Rectangle(box.X + 6, box.Bottom - 10, 10, 5), 1, Fade(Theme.Success, 180));
-    }
-}
-
 // ========================================= 6. 根目录残留：枝叶逐个被剪掉
 
 internal sealed class RootsAnim : AnimBase
@@ -364,30 +306,64 @@ internal sealed class DevAnim : AnimBase
     }
 }
 
-// ============================== 8. 全盘大目录：实时柱状图（吃扫描结果）
-
-internal sealed class LargeDirsAnim : AnimBase
+// ============== 8/9. 扫描页：大目录=实时柱状图，项目缓存=实时瓷贴（都吃扫描结果）
+//
+// One class with a mode flag instead of two classes: a page takes its animation at
+// construction, so the merged scan page has ONE strip and switching its mode has to
+// switch the motif too. Both motifs read the same live feed.
+internal sealed class ScanAnim : AnimBase
 {
+    internal bool Tiles;            // false = bars (large dirs), true = tiles (project caches)
+
     private readonly List<ScanHit> _live = new List<ScanHit>();
+    private readonly Dictionary<string, int> _born = new Dictionary<string, int>();
 
     internal override void FeedLive(List<ScanHit> hits)
     {
         _live.Clear();
-        if (hits != null)
+
+        // A null feed means "a new scan is starting", so everything resets. This used to
+        // return without clearing, which left the previous scan's tiles on screen and let
+        // the grid only ever grow.
+        if (hits == null) { _born.Clear(); Invalidate(); return; }
+
+        // The whole set is kept (the bar motif then draws only the first 7), so switching
+        // mode between two scans does not need a re-feed to be correct.
+        for (int i = 0; i < hits.Count && i < 9; i++) _live.Add(hits[i]);
+
+        // Rebuild rather than append: hits arrive sorted by size, and between polls the
+        // set can lose entries (the size floor is applied while the scan runs), so
+        // appending alone kept tiles for folders the final list does not contain.
+        // Entries that survive keep their birth frame, so their grow-in does not replay.
+        Dictionary<string, int> born = new Dictionary<string, int>();
+        for (int i = 0; i < _live.Count; i++)
         {
-            for (int i = 0; i < hits.Count && i < 7; i++) _live.Add(hits[i]);
+            int had;
+            born[_live[i].Path] = _born.TryGetValue(_live[i].Path, out had) ? had : Frame;
         }
+        _born.Clear();
+        foreach (KeyValuePair<string, int> kv in born) _born[kv.Key] = kv.Value;
         Invalidate();
     }
 
     protected override void DrawMotif(Graphics g, Rectangle box, int frame, bool running)
     {
+        if (Tiles) DrawTiles(g, box, frame);
+        else DrawBars(g, box, frame, running);
+    }
+
+    private void DrawBars(Graphics g, Rectangle box, int frame, bool running)
+    {
         using (Pen p = new Pen(Fade(Theme.ConsoleFg, 55), 1f))
             g.DrawLine(p, box.X + 4, box.Bottom - 6, box.Right - 4, box.Bottom - 6);
 
-        int count = _live.Count > 0 ? _live.Count : 6;
+        // 6 breathing bars while idle. The max-bar scan has to stay bounded by _live.Count
+        // and NOT by `count`: with an empty list `count` is 6, so indexing _live[i] threw
+        // ArgumentOutOfRangeException inside OnPaint - exactly the state the page is in the
+        // moment you switch to 大目录 mode. It was sitting in gui-crash.log, not on screen.
+        int count = _live.Count > 0 ? Math.Min(_live.Count, 7) : 6;
         long max = 1;
-        for (int i = 0; i < _live.Count; i++) if (_live[i].Bytes > max) max = _live[i].Bytes;
+        for (int i = 0; i < _live.Count && i < 7; i++) if (_live[i].Bytes > max) max = _live[i].Bytes;
 
         int slot = Math.Max(6, (box.Width - 12) / Math.Max(1, count));
         int barW = Math.Max(4, slot - 2);
@@ -412,46 +388,15 @@ internal sealed class LargeDirsAnim : AnimBase
                 g.DrawLine(p, x, box.Y + 4, x, box.Bottom - 6);
         }
     }
-}
 
-// ============================== 9. 隐藏项目缓存：实时瓷贴（吃扫描结果）
-
-internal sealed class CacheTilesAnim : AnimBase
-{
-    private readonly List<string> _paths = new List<string>();
-    private readonly List<long> _sizes = new List<long>();
-    private readonly Dictionary<string, int> _born = new Dictionary<string, int>();
-
-    internal override void FeedLive(List<ScanHit> hits)
-    {
-        if (hits == null) return;
-        for (int i = 0; i < hits.Count && i < 9; i++)
-        {
-            string p = hits[i].Path;
-            if (_born.ContainsKey(p)) continue;
-            _born[p] = Frame;
-            _paths.Add(p);
-            _sizes.Add(hits[i].Bytes);
-        }
-        Invalidate();
-    }
-
-    internal void ClearTiles()
-    {
-        _paths.Clear();
-        _sizes.Clear();
-        _born.Clear();
-        Invalidate();
-    }
-
-    protected override void DrawMotif(Graphics g, Rectangle box, int frame, bool running)
+    private void DrawTiles(Graphics g, Rectangle box, int frame)
     {
         const int cols = 3, rows = 3, gap = 3;
         int tw = (box.Width - 8 - (cols - 1) * gap) / cols;
         int th = (box.Height - 8 - (rows - 1) * gap) / rows;
 
         long max = 1;
-        for (int i = 0; i < _sizes.Count; i++) if (_sizes[i] > max) max = _sizes[i];
+        for (int i = 0; i < _live.Count; i++) if (_live[i].Bytes > max) max = _live[i].Bytes;
 
         for (int i = 0; i < cols * rows; i++)
         {
@@ -459,14 +404,16 @@ internal sealed class CacheTilesAnim : AnimBase
                 box.X + 4 + (i % cols) * (tw + gap),
                 box.Y + 4 + (i / cols) * (th + gap), tw, th);
 
-            if (i >= _paths.Count)
+            if (i >= _live.Count)
             {
                 // empty slot
                 Theme.DrawRound(g, cell, 3, Fade(Theme.ConsoleFg, 45), 1f);
                 continue;
             }
 
-            int age = frame - _born[_paths[i]];
+            int born;
+            if (!_born.TryGetValue(_live[i].Path, out born)) born = frame;
+            int age = frame - born;
             if (age < 0) age = 0;
             double grow = Math.Min(1.0, age / 8.0);
             int inset = (int)((1.0 - grow) * th / 2);
@@ -474,7 +421,7 @@ internal sealed class CacheTilesAnim : AnimBase
             Sq(g, tile, 3, Fade(Theme.Accent, 60 + (i % 3) * 40));
 
             // mini size bar inside the tile
-            int w = (int)((tile.Width - 6) * ((double)_sizes[i] / max));
+            int w = (int)((tile.Width - 6) * ((double)_live[i].Bytes / max));
             if (w < 2) w = 2;
             Sq(g, new Rectangle(tile.X + 3, tile.Bottom - 4, w, 2), 1, Fade(Theme.Accent, 235));
         }
@@ -546,6 +493,10 @@ internal class SummaryView : Control, IThemed
         Counts = counts;
         Key = key;
         Tone = tone;
+        // The hint is idle-state text ("点下方按钮运行一次…"). Leaving it in place once a
+        // result is on the card made it collide with the counts line: the hint is painted
+        // at Height-26, and a card showing state/meta/counts/key already reaches y=96.
+        Hint = "";
         Publish();
         Invalidate();
     }
