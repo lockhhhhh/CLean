@@ -1,0 +1,12 @@
+# Line endings are load-bearing in this repo.
+#
+# The 11 embedded scripts must stay LF-only and pure ASCII: Windows PowerShell 5.1 reads a
+# .ps1 without a BOM as ANSI, and src/Tests.ps1 asserts both properties. With core.autocrlf
+# enabled git would rewrite them as CRLF on the next checkout and the test would fail, so the
+# rule is pinned here rather than left to a per-machine setting.
+*.ps1   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.cs    text eol=lf
+*.iss   text eol=crlf
+*.exe   binary
