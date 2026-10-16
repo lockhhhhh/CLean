@@ -31,6 +31,7 @@ param(
 )
 
 . (Join-Path $PSScriptRoot '_Common.ps1')
+. (Join-Path $PSScriptRoot '_SystemCatalog.ps1')
 
 if ($ScanRoots.Count -eq 0) {
     $ScanRoots = @(
@@ -41,12 +42,9 @@ if ($ScanRoots.Count -eq 0) {
 
 foreach ($r in $ScanRoots) { Add-AllowedRoot @($r) }
 
-# Names that are unambiguously regenerable caches.
-$cacheNames = @(
-    'node_modules', '.cache', '.next', '.nuxt', '.turbo', '.parcel-cache',
-    '.pytest_cache', '.mypy_cache', '.ruff_cache', '__pycache__',
-    '.venv', 'venv', '.tox', '.svelte-kit', '.angular', 'bower_components'
-)
+# Names that are unambiguously regenerable caches. Defined in _SystemCatalog.ps1, not
+# here: this file, 05 and the GUI each carried a copy and they had drifted apart.
+$cacheNames = @(Get-ProjectCacheNames)
 
 $mode = 'SCAN (read-only)'
 if ($Execute) { $mode = 'DELETE' }

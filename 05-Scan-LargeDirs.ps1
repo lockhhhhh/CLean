@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
   05-Scan-LargeDirs.ps1  --  READ-ONLY. One-pass aggregation of directory sizes
   across a drive, so you can see where the space actually went.
@@ -23,6 +23,10 @@ if (-not $Root.EndsWith('\')) { $Root = $Root + '\' }
 $depth3 = @{}
 $depth1 = @{}
 $cacheHits = @{}
+# DELIBERATELY NOT Get-ProjectCacheNames(@('...') from _SystemCatalog.ps1): this list only
+# LABELS a row in the report ("this big folder is a cache"), it never authorises a delete,
+# so it also covers system caches (Cache / Code Cache / GPUCache / Temp / Logs). The list
+# that authorises deletion is the one in _SystemCatalog.ps1.
 $cacheNames = @('node_modules', '.cache', '.gradle', '.m2', '.nuget', '.venv', 'venv',
                 '__pycache__', '.next', '.nuxt', '.turbo', 'Cache', 'Code Cache',
                 'GPUCache', 'CachedData', 'Temp', 'Logs', 'logs', 'CrashDumps')
@@ -76,5 +80,5 @@ if (-not (Test-Path -LiteralPath $repDir)) { New-Item -ItemType Directory -Path 
         [ordered]@{ Path = ($Root + $_.Key); MB = [math]::Round($_.Value / 1MB, 1) } })
     Depth3 = @($topList | ForEach-Object {
         [ordered]@{ Path = ($Root + $_.Key); MB = [math]::Round($_.Value / 1MB, 1) } })
-} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $repDir ("{0}.json" -f $Tag)) -Encoding UTF8
+} | ConvertTo-Json -Depth 5 | ForEach-Object { $null = Write-ReportText -Path (Join-Path $repDir ("{0}.json" -f $Tag)) -Text $_ }
 Write-Host ("`n report -> {0}" -f (Join-Path $repDir ("{0}.json" -f $Tag)))

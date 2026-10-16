@@ -23,6 +23,23 @@
   Test-SafeTarget's allowlist and denylist in _Common.ps1.
 #>
 
+# Project-cache directory names: each one belongs to a package manager or build tool
+# and regenerates on the next install/build, so the whole directory may be removed.
+#
+# THIS FUNCTION IS THE ONLY PLACE THIS LIST EXISTS. Three copies used to live in the
+# repo (04-Clean-Hidden.ps1, 05-Scan-LargeDirs.ps1 and the GUI's C# scanner) and they
+# had already drifted: the GUI knew .tox but not .nuget, 05 knew .nuget but not .tox.
+# 05's list is a different thing on purpose (it only LABELS rows, so it also covers
+# system caches - see the comment there). The GUI's copy is generated from here by
+# src\Build.ps1 at build time, so there is nothing left to keep in step by hand.
+function Get-ProjectCacheNames {
+    return @(
+        'node_modules', '.cache', '.next', '.nuxt', '.turbo', '.parcel-cache',
+        '.pytest_cache', '.mypy_cache', '.ruff_cache', '__pycache__',
+        '.venv', 'venv', '.tox', '.svelte-kit', '.angular', 'bower_components'
+    )
+}
+
 # --------------------------------------------------------------- name sets
 <#
   Directory names that are, unambiguously, regenerable caches. Used by the
