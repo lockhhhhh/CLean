@@ -1,10 +1,16 @@
 # AGENTS.md
 
 **CLean** —— Windows C 盘清理工具的一个仓库：**单文件、零依赖**的两个外壳（控制台菜单版 + WinForms 窗口版），
-把 10 个 `.ps1` 清理脚本作为资源内嵌进 EXE，首次运行释放到 `%LOCALAPPDATA%\CLean\runtime`。
+把 11 个 `.ps1` 清理脚本作为资源内嵌进 EXE，首次运行释放到 `%LOCALAPPDATA%\CLean\runtime`。
 
 安全契约（默认只读、删除类动作先 dry-run 再确认、脚本侧白名单 + 净空间守卫）与全部实测记录见
 [`README.md`](README.md)。
+
+## 注意事项
+
+1. 每次改动完成后都必须创建一个对应的 Git commit，以便后续追踪和回滚
+   （提交前先确认 `HOME` 与 `%USERPROFILE%` 一致，否则会报「没有作者身份」，见「环境陷阱」）。
+2. 每次改动后都必须编写或更新相关测试，并在交付给用户前，确保所有测试和验证全部通过。
 
 ## 版本号
 
@@ -23,7 +29,7 @@
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\src\Build.ps1        # 控制台版 -> CLean.exe
 .\src\Build.ps1 -Gui   # 窗口版   -> CLean-GUI.exe
-                       #            （GuiLauncher.cs + GuiPages.cs + GuiAnims.cs + UpdateCheck.cs）
+                       #            （GuiLauncher.cs + GuiPages.cs + GuiAnims.cs + ReportView.cs + UpdateCheck.cs）
 ```
 
 `src/UpdateCheck.cs`（向 GitHub Releases API 问「有没有新版本」）**两个外壳共用**，改动它等于同时改两边。
