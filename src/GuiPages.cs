@@ -179,6 +179,15 @@ internal static class Settings
         get { return Get("rail", "expanded") != "collapsed"; }
         set { Set("rail", value ? "expanded" : "collapsed"); }
     }
+
+    // ---- the window's animation preference (see Motion.Preference) ----------
+    // Kept as a plain key here rather than a bool: "auto" is the default and means
+    // "follow Windows", which is not the same as either "on" or "off".
+    internal static string MotionPreference
+    {
+        get { return Get("motion", "auto"); }
+        set { Set("motion", value); }
+    }
 }
 
 // ================================================================ cleanup ledger

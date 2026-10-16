@@ -266,6 +266,187 @@ if ($buildOk) {
 }
 Remove-Item $probeExe -Force -EA SilentlyContinue
 
+Write-Host '=== 10. motion: tokens, curves and the reduced-motion gate ==='
+# Three things can rot here without anyone noticing: Build.ps1 stops compiling Motion.cs,
+# someone "tidies" a duration, or the easing maths quietly becomes an approximation. The
+# durations are checked as literals (they are a documented contract, see README) and the
+# curves are checked by compiling Motion.cs alone - only Theme.Mix may come from outside,
+# which the minimal stub in the probe enforces.
+$motionSrc = Join-Path $repo 'src\Motion.cs'
+Check 'src\Motion.cs exists' (Test-Path $motionSrc)
+$mSrc = Get-Content $motionSrc -Raw
+Check 'Build.ps1 compiles Motion.cs into the GUI' ($buildSrc -match "extraSources = @\([^)]*'Motion\.cs'")
+
+$mBytes = [System.IO.File]::ReadAllBytes($motionSrc)
+Check 'Motion.cs is UTF-8 without a BOM' (-not (($mBytes[0] -eq 0xEF) -and ($mBytes[1] -eq 0xBB) -and ($mBytes[2] -eq 0xBF)))
+Check 'Motion.cs uses LF line endings like its neighbours' ([Array]::IndexOf($mBytes, [byte]13) -lt 0)
+
+foreach ($tok in @(@('DurPress', 110), @('DurHover', 140), @('DurToggle', 170), @('DurRail', 190),
+                    @('DurPanel', 210), @('DurPage', 200), @('DurData', 420))) {
+    Check ("Motion." + $tok[0] + " is still " + $tok[1] + "ms") ($mSrc -match ("const int " + $tok[0] + " = " + $tok[1] + ";"))
+}
+Check 'the audit curve is still cubic-bezier(0.23, 1, 0.32, 1)' ($mSrc -match '0\.23, 1, 0\.32, 1')
+Check 'the travel curve is still cubic-bezier(0.77, 0, 0.175, 1)' ($mSrc -match '0\.77, 0, 0\.175, 1')
+Check 'reduced motion keeps colour but drops movement' (($mSrc -match 'Reduced \? Math\.Min\(ms, 90\) : ms') -and ($mSrc -match 'Reduced \? 0 : ms'))
+
+$probeDir = New-Fixture 'clean-t-motion'
+$probeCs = Join-Path $probeDir 'MotionProbe.cs'
+$probeExe = Join-Path $probeDir 'motion-probe.exe'
+$probeCode = @'
+using System;
+using System.Drawing;
+using System.Threading;
+
+// The only things Motion.cs is allowed to need from the GUI layer: one colour lerp and the
+// stored preference. Anything else it starts reaching for shows up here as a compile error.
+internal static class Theme
+{
+    internal static Color Mix(Color a, Color b, float t)
+    {
+        if (t < 0f) t = 0f;
+        if (t > 1f) t = 1f;
+        return Color.FromArgb(
+            (int)Math.Round(a.R + (b.R - a.R) * t),
+            (int)Math.Round(a.G + (b.G - a.G) * t),
+            (int)Math.Round(a.B + (b.B - a.B) * t));
+    }
+}
+
+internal static class Settings
+{
+    internal static string MotionPreference = "auto";
+}
+
+internal static class MotionProbe
+{
+    private static int _fail;
+
+    private static void Check(string name, bool ok, string detail)
+    {
+        if (!ok) { _fail++; Console.WriteLine("FAIL " + name + " " + detail); }
+    }
+
+    private static void Near(string name, double got, double want, double tol)
+    {
+        Check(name, Math.Abs(got - want) <= tol,
+              "(got " + got.ToString("0.####") + " want " + want.ToString("0.####") + ")");
+    }
+
+    private static int Main()
+    {
+        Near("Out(0)", Motion.Apply(Ease.Out, 0.0), 0.0, 1e-9);
+        Near("Out(1)", Motion.Apply(Ease.Out, 1.0), 1.0, 1e-9);
+        Near("Out(0.5)", Motion.Apply(Ease.Out, 0.5), 0.9657, 0.002);
+        Near("InOut(0.5)", Motion.Apply(Ease.InOut, 0.5), 0.5960, 0.002);
+        Near("Linear(0.37)", Motion.Apply(Ease.Linear, 0.37), 0.37, 1e-9);
+        Near("Clamp01(-1)", Motion.Clamp01(-1.0), 0.0, 1e-12);
+        Near("Clamp01(2)", Motion.Clamp01(2.0), 1.0, 1e-12);
+
+        bool mono = true;
+        double prev = -1.0;
+        for (int i = 0; i <= 200; i++)
+        {
+            double v = Motion.Apply(Ease.Out, i / 200.0);
+            if (v < prev - 1e-9) mono = false;
+            prev = v;
+        }
+        Check("Out never goes backwards", mono, "");
+
+        mono = true; prev = -1.0;
+        double peak = 0.0;
+        for (int i = 0; i <= 200; i++)
+        {
+            double v = Motion.Apply(Ease.InOut, i / 200.0);
+            if (v < prev - 1e-9) mono = false;
+            prev = v;
+            double b = Motion.Apply(Ease.OutBack, i / 200.0);
+            if (b > peak) peak = b;
+        }
+        Check("InOut never goes backwards", mono, "");
+        Check("OutBack overshoots then lands", (peak > 1.005) && (peak < 1.15), "(peak " + peak.ToString("0.####") + ")");
+        Near("OutBack(1)", Motion.Apply(Ease.OutBack, 1.0), 1.0, 1e-9);
+
+        Color red = Color.FromArgb(255, 0, 0);
+        Color blue = Color.FromArgb(0, 0, 255);
+        Check("Blend(0) is the first colour", Motion.Blend(red, blue, 0.0) == red, "");
+        Check("Blend(1) is the second colour", Motion.Blend(red, blue, 1.0) == blue, "");
+        Check("Blend clamps past the end", Motion.Blend(red, blue, -3.0) == red, "");
+        Near("Blend(0.5) is halfway", Motion.Blend(red, blue, 0.5).R, 128.0, 1.0);
+
+        Motion.Preference = "auto";
+        Motion.ForceFull = true;
+        Motion.ForceReduced = false;
+        Check("auto while Windows animates is not reduced", !Motion.Reduced, "");
+        Check("Dur passes through when animating", Motion.Dur(Motion.DurRail) == Motion.DurRail, "");
+        Check("Soft passes through when animating", Motion.Soft(Motion.DurPanel) == Motion.DurPanel, "");
+
+        Motion.ForceFull = false;
+        Motion.ForceReduced = true;
+        Check("the forced-reduced hook bites", Motion.Reduced, "");
+        Check("reduced motion snaps movement to zero", Motion.Dur(Motion.DurRail) == 0, "");
+        Check("reduced motion keeps colour, only shorter",
+              (Motion.Soft(Motion.DurPanel) > 0) && (Motion.Soft(Motion.DurPanel) <= 90),
+              "(soft " + Motion.Soft(Motion.DurPanel) + ")");
+
+        Motion.ForceReduced = false;
+        Motion.ForceFull = true;
+        Motion.Preference = "on";
+        Check("preference 'on' animates even with Windows off", !Motion.Reduced, "");
+        Motion.Preference = "off";
+        Check("preference 'off' animates nothing", Motion.Reduced, "");
+        Motion.SetPreference("nonsense");
+        Check("an unknown preference falls back to auto", Settings.MotionPreference == "auto", "");
+        Motion.Preference = "auto";
+
+        // A channel must be re-targetable mid-flight: that is the whole difference between
+        // a transition and a keyframe replay.
+        Channel ch = new Channel();
+        ch.SnapTo(0.0);
+        double t0 = Motion.Now;
+        ch.To(1.0, 300, Ease.Linear);
+        while (ch.Running && (Motion.Now - t0) < 150) { ch.Advance(); Thread.Sleep(1); }
+        double mid = ch.Value;
+        Check("the channel is on its way", (mid > 0.15) && (mid < 0.9), "(mid " + mid.ToString("0.###") + ")");
+        ch.To(0.0, 300, Ease.Linear);
+        double after = ch.Value;
+        Check("re-targeting does not jump", Math.Abs(after - mid) < 0.2,
+              "(mid " + mid.ToString("0.###") + " after " + after.ToString("0.###") + ")");
+        while (ch.Running && (Motion.Now - t0) < 900) { ch.Advance(); Thread.Sleep(1); }
+        Check("the channel settles where it was sent", Math.Abs(ch.Value) < 0.02, "(value " + ch.Value.ToString("0.###") + ")");
+        ch.SnapTo(0.25);
+        Check("SnapTo is immediate and stops the channel", (Math.Abs(ch.Value - 0.25) < 1e-9) && !ch.Running, "");
+
+        Console.WriteLine(_fail == 0 ? "motion probe ok" : (_fail + " motion checks failed"));
+        return _fail == 0 ? 0 : 1;
+    }
+}
+'@
+[System.IO.File]::WriteAllText($probeCs, $probeCode, (New-Object System.Text.UTF8Encoding($false)))
+
+$csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+if (-not (Test-Path $csc)) { $csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework\v4.0.30319\csc.exe' }
+$compiled = $true
+$compileOut = ''
+$oldEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $compileOut = (& $csc /nologo /target:exe /codepage:65001 /main:MotionProbe /out:$probeExe `
+        /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll $motionSrc $probeCs 2>&1) -join ' | '
+    $compiled = ($LASTEXITCODE -eq 0) -and (Test-Path $probeExe)
+} catch { $compiled = $false; $compileOut = $_.Exception.Message }
+$ErrorActionPreference = $oldEAP
+Check 'Motion.cs compiles on its own (Theme.Mix is all it borrows)' $compiled $compileOut
+
+if ($compiled) {
+    $ErrorActionPreference = 'Continue'
+    $probeOut = & $probeExe 2>&1
+    $probeCode2 = $LASTEXITCODE
+    $ErrorActionPreference = $oldEAP
+    $probeOut | Where-Object { $_ -like 'FAIL*' } | ForEach-Object { Write-Host ("    " + $_) }
+    Check 'the motion maths probe passes' ($probeCode2 -eq 0) "($($probeOut -join ' '))"
+}
+Remove-Item $probeDir -Recurse -Force -EA SilentlyContinue
+
 Remove-Item $root -Recurse -Force -EA SilentlyContinue
 
 Write-Host ''

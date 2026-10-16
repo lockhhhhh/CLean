@@ -126,14 +126,14 @@ function Find-ByteSequence {
 # The GUI target compiles GuiLauncher.cs as a windowed app; the default target
 # compiles Launcher.cs as a console app. Everything else is identical.
 # UpdateCheck.cs (the "is there a newer release?" client) is shared by both.
-# The GUI is split over four sources (window / pages+scanner / animations / report
-# rendering); all go to csc.
+# The GUI is split over five sources (window / pages+scanner / animations / report
+# rendering / motion); all go to csc.
 $sourceFile = 'Launcher.cs'
 $extraSources = @('UpdateCheck.cs')
 $target     = 'exe'
 if ($Gui) {
     $sourceFile = 'GuiLauncher.cs'
-    $extraSources = @('GuiPages.cs', 'GuiAnims.cs', 'ReportView.cs', 'UpdateCheck.cs')
+    $extraSources = @('GuiPages.cs', 'GuiAnims.cs', 'ReportView.cs', 'Motion.cs', 'UpdateCheck.cs')
     $target = 'winexe'
 }
 

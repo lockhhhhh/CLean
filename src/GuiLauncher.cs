@@ -32,6 +32,7 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -68,6 +69,7 @@ internal static class Program
         // state have to be in place before the first control is constructed, or the
         // window would visibly flash the defaults.
         Theme.LoadPreference();
+        Motion.LoadPreference();
 
         if (args != null && args.Length > 0)
         {
@@ -913,8 +915,13 @@ internal class FlatButton : Button, IThemed
     internal int Radius = 8;
 
     private ButtonRole _role = ButtonRole.Ghost;
-    private bool _hot;
-    private bool _down;
+
+    // Hover and press are animated channels rather than booleans: the fill slides between
+    // states, and a fast in-and-out re-targets from wherever the colour actually is
+    // instead of replaying from the start (plans/003-interaction-feedback.md).
+    private readonly MotionDriver _anim;
+    private readonly Channel _hotT;
+    private readonly Channel _pressT;
 
     internal ButtonRole Role
     {
@@ -933,6 +940,11 @@ internal class FlatButton : Button, IThemed
         UseVisualStyleBackColor = false;
         Size = new Size(110, 34);
         Cursor = Cursors.Hand;
+
+        _anim = new MotionDriver(this, 2);
+        _hotT = _anim.Ch(0);
+        _pressT = _anim.Ch(1);
+
         ApplyPalette();
     }
 
@@ -983,11 +995,13 @@ internal class FlatButton : Button, IThemed
         Invalidate();
     }
 
-    protected override void OnMouseEnter(EventArgs e) { _hot = true; Invalidate(); base.OnMouseEnter(e); }
-    protected override void OnMouseLeave(EventArgs e) { _hot = false; _down = false; Invalidate(); base.OnMouseLeave(e); }
-    protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) { _down = true; Invalidate(); } base.OnMouseDown(e); }
-    protected override void OnMouseUp(MouseEventArgs e) { _down = false; Invalidate(); base.OnMouseUp(e); }
-    protected override void OnEnabledChanged(EventArgs e) { _down = false; _hot = false; Invalidate(); base.OnEnabledChanged(e); }
+    // Deliberately asymmetric: the press (110ms) is the acknowledgment and is given more
+    // time than the release (140ms band, the system returning to rest).
+    protected override void OnMouseEnter(EventArgs e) { _anim.Feedback(0, 1.0, Motion.DurHover, Ease.Out); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { _anim.Feedback(0, 0.0, Motion.DurHover, Ease.Out); _anim.Feedback(1, 0.0, Motion.DurHover, Ease.Out); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) _anim.Feedback(1, 1.0, Motion.DurPress, Ease.Out); base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { _anim.Feedback(1, 0.0, Motion.DurHover, Ease.Out); base.OnMouseUp(e); }
+    protected override void OnEnabledChanged(EventArgs e) { _anim.Snap(0, 0.0); _anim.Snap(1, 0.0); base.OnEnabledChanged(e); }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -995,21 +1009,30 @@ internal class FlatButton : Button, IThemed
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.Clear(Parent != null ? Parent.BackColor : Theme.Bg);
 
+        double hot = _hotT.Value;
+        double press = _pressT.Value;
+
         Color fill = Fill;
         if (!Enabled)
         {
             fill = Theme.Mix(Fill, Theme.Bg, 0.55f);
         }
-        else if (_down)
+        else
         {
-            fill = (FillDown != Color.Empty) ? FillDown : Theme.Darken(Fill, 0.08f);
-        }
-        else if (_hot)
-        {
-            fill = (FillHot != Color.Empty) ? FillHot : Theme.Darken(Fill, 0.04f);
+            // Two blends instead of a three-way boolean: hover slides the fill towards
+            // FillHot, the press slides it further. A quick in-and-out reads as one
+            // movement instead of two jumps.
+            Color hotFill = (FillHot != Color.Empty) ? FillHot : Theme.Darken(Fill, 0.04f);
+            Color downFill = (FillDown != Color.Empty) ? FillDown : Theme.Darken(Fill, 0.08f);
+            fill = Motion.Blend(Fill, hotFill, hot);
+            fill = Motion.Blend(fill, downFill, press);
         }
 
-        Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
+        // The press sink: scale(0.97) in layout terms, held to a single pixel so the button
+        // reads as giving way rather than moving.
+        int inset = (int)Math.Round(press);
+        Rectangle r = new Rectangle(inset, inset, Width - 1 - inset * 2, Height - 1 - inset * 2);
+        if (r.Width < 2 || r.Height < 2) r = new Rectangle(0, 0, Width - 1, Height - 1);
         Theme.FillRound(g, r, Radius, fill);
 
         if (BorderColor != Color.Empty)
@@ -1022,13 +1045,22 @@ internal class FlatButton : Button, IThemed
         // focus cues). Calling it here would draw that on top of everything above,
         // so this control is fully custom-painted and never chains to the base.
     }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && _anim != null) _anim.Dispose();
+        base.Dispose(disposing);
+    }
 }
 
 // Radio drawn as a pill: the segmented-control look, no OS glyph.
 internal class PillRadio : RadioButton, IThemed
 {
-    private bool _hot;
     private readonly int _pad = 14;
+
+    private readonly MotionDriver _anim;
+    private readonly Channel _hotT;
+    private readonly Channel _onT;
 
     internal PillRadio(string text)
     {
@@ -1040,7 +1072,13 @@ internal class PillRadio : RadioButton, IThemed
         Height = 30;
         Width = TextRenderer.MeasureText(text, Font).Width + _pad * 2;
         Cursor = Cursors.Hand;
-        CheckedChanged += delegate { Invalidate(); };
+
+        _anim = new MotionDriver(this, 2);
+        _hotT = _anim.Ch(0);
+        _onT = _anim.Ch(1);
+        _onT.SnapTo(Checked ? 1.0 : 0.0);
+
+        CheckedChanged += delegate { _anim.Feedback(1, Checked ? 1.0 : 0.0, Motion.DurToggle, Ease.Out); };
     }
 
     public void ApplyPalette()
@@ -1048,8 +1086,8 @@ internal class PillRadio : RadioButton, IThemed
         Invalidate();
     }
 
-    protected override void OnMouseEnter(EventArgs e) { _hot = true; Invalidate(); base.OnMouseEnter(e); }
-    protected override void OnMouseLeave(EventArgs e) { _hot = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseEnter(EventArgs e) { _anim.Feedback(0, 1.0, Motion.DurHover, Ease.Out); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { _anim.Feedback(0, 0.0, Motion.DurHover, Ease.Out); base.OnMouseLeave(e); }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -1057,27 +1095,38 @@ internal class PillRadio : RadioButton, IThemed
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.Clear(Parent != null ? Parent.BackColor : Theme.Card);
 
+        double hot = _hotT.Value;
+        double on = _onT.Value;
+
+        // One pill, two animated axes: hover moves fill and border towards the accent,
+        // selection then crosses fully into the accent fill and swaps the ink. The border
+        // disappears into the fill at on = 1, which is what the checked state looked like.
+        Color fill = Motion.Blend(Motion.Blend(Theme.Card, Theme.Hover, hot), Theme.Accent, on);
+        Color border = Motion.Blend(Theme.Border, Theme.Accent, Math.Max(hot, on));
+        Color ink = Motion.Blend(Theme.Text, Theme.OnAccent, on);
+
         Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
-        if (Checked)
-        {
-            Theme.FillRound(g, r, Height / 2, Theme.Accent);
-            TextRenderer.DrawText(g, Text, Font, r, Theme.OnAccent, Theme.CenterFlags);
-        }
-        else
-        {
-            Theme.FillRound(g, r, Height / 2, _hot ? Theme.Hover : Theme.Card);
-            Theme.DrawRound(g, r, Height / 2, _hot ? Theme.Accent : Theme.Border, 1f);
-            TextRenderer.DrawText(g, Text, Font, r, Theme.Text, Theme.CenterFlags);
-        }
+        Theme.FillRound(g, r, Height / 2, fill);
+        Theme.DrawRound(g, r, Height / 2, border, 1f);
+        TextRenderer.DrawText(g, Text, Font, r, ink, Theme.CenterFlags);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && _anim != null) _anim.Dispose();
+        base.Dispose(disposing);
     }
 }
 
 // Checkbox drawn as a rounded box plus a hand-drawn tick.
 internal class PillCheck : CheckBox, IThemed
 {
-    private bool _hot;
     private const int Box = 17;
     private const int Gap = 8;
+
+    private readonly MotionDriver _anim;
+    private readonly Channel _hotT;
+    private readonly Channel _onT;
 
     internal PillCheck(string text)
     {
@@ -1089,7 +1138,13 @@ internal class PillCheck : CheckBox, IThemed
         Height = 26;
         Width = Box + Gap + TextRenderer.MeasureText(text, Font).Width + 4;
         Cursor = Cursors.Hand;
-        CheckedChanged += delegate { Invalidate(); };
+
+        _anim = new MotionDriver(this, 2);
+        _hotT = _anim.Ch(0);
+        _onT = _anim.Ch(1);
+        _onT.SnapTo(Checked ? 1.0 : 0.0);
+
+        CheckedChanged += delegate { _anim.Feedback(1, Checked ? 1.0 : 0.0, Motion.DurToggle, Ease.Out); };
     }
 
     public void ApplyPalette()
@@ -1097,8 +1152,8 @@ internal class PillCheck : CheckBox, IThemed
         Invalidate();
     }
 
-    protected override void OnMouseEnter(EventArgs e) { _hot = true; Invalidate(); base.OnMouseEnter(e); }
-    protected override void OnMouseLeave(EventArgs e) { _hot = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseEnter(EventArgs e) { _anim.Feedback(0, 1.0, Motion.DurHover, Ease.Out); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { _anim.Feedback(0, 0.0, Motion.DurHover, Ease.Out); base.OnMouseLeave(e); }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -1106,40 +1161,57 @@ internal class PillCheck : CheckBox, IThemed
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.Clear(Parent != null ? Parent.BackColor : Theme.Card);
 
+        double hot = _hotT.Value;
+        double on = _onT.Value;
+
         int top = (Height - Box) / 2;
         Rectangle box = new Rectangle(0, top, Box, Box);
 
-        if (Checked)
+        Color boxFill = Motion.Blend(Theme.Card, Theme.Accent, on);
+        Color boxBorder = Motion.Blend(Theme.CheckBorder, Theme.Accent, Math.Max(hot, on));
+        Theme.FillRound(g, box, 5, boxFill);
+        Theme.DrawRound(g, box, 5, boxBorder, 1.2f);
+
+        // The tick fades in with the box rather than growing out of a corner (a tick that
+        // creeps from nothing looks cheap), and its ink comes up faster than the fill moves.
+        if (on > 0.02)
         {
-            Theme.FillRound(g, box, 5, Theme.Accent);
-            using (Pen pen = new Pen(Theme.OnAccent, 2f))
+            float k = (float)(0.7 + 0.3 * on);
+            float cx = box.X + Box / 2f;
+            float cy = box.Y + Box / 2f;
+            PointF[] tick = new PointF[]
+            {
+                new PointF(cx + (box.X + 4  - cx) * k, cy + (box.Y + 9  - cy) * k),
+                new PointF(cx + (box.X + 7  - cx) * k, cy + (box.Y + 12 - cy) * k),
+                new PointF(cx + (box.X + 13 - cx) * k, cy + (box.Y + 5  - cy) * k)
+            };
+            Color ink = Motion.Blend(boxFill, Theme.OnAccent, Math.Min(1.0, on * 1.6));
+            using (Pen pen = new Pen(ink, 2f))
             {
                 pen.StartCap = LineCap.Round;
                 pen.EndCap = LineCap.Round;
-                g.DrawLines(pen, new Point[]
-                {
-                    new Point(box.X + 4,  box.Y + 9),
-                    new Point(box.X + 7,  box.Y + 12),
-                    new Point(box.X + 13, box.Y + 5)
-                });
+                g.DrawLines(pen, tick);
             }
-        }
-        else
-        {
-            Theme.FillRound(g, box, 5, Theme.Card);
-            Theme.DrawRound(g, box, 5, _hot ? Theme.Accent : Theme.CheckBorder, 1.2f);
         }
 
         Rectangle textRect = new Rectangle(Box + Gap, 0, Width - Box - Gap, Height);
         TextRenderer.DrawText(g, Text, Font, textRect, Theme.Text, Theme.LeftFlags);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && _anim != null) _anim.Dispose();
+        base.Dispose(disposing);
     }
 }
 
 // Segmented disk-usage bar; colour warns as the volume fills up.
 internal class UsageBar : Control, IThemed
 {
-    private double _used;
-    private double _total;
+    // The bar paints an animated value, not the raw numbers: SetValue re-targets a channel
+    // so the length and its warning colour travel together (plans/004-usage-bar-tween.md).
+    private readonly MotionDriver _anim;
+    private double _shown;      // -1 until the first value arrives - that one must not animate
 
     internal UsageBar()
     {
@@ -1148,6 +1220,9 @@ internal class UsageBar : Control, IThemed
         Height = 8;
         TabStop = false;
         SetStyle(ControlStyles.Selectable, false);
+
+        _anim = new MotionDriver(this, 1);
+        _shown = -1;
     }
 
     public void ApplyPalette()
@@ -1157,9 +1232,22 @@ internal class UsageBar : Control, IThemed
 
     internal void SetValue(long used, long total)
     {
-        _used = used;
-        _total = total;
-        Invalidate();
+        double pct = (total > 0) ? ((double)used / total) : 0.0;
+        if (pct < 0.0) pct = 0.0;
+        if (pct > 1.0) pct = 1.0;
+
+        if (_shown < 0)
+        {
+            // First value appears at its real level. Growing from zero would be decoration:
+            // this bar reports a measurement, it is not progress through a task.
+            _shown = pct;
+            _anim.Snap(0, pct);
+        }
+        else
+        {
+            _shown = pct;
+            _anim.Feedback(0, pct, Motion.DurData, Ease.Out);
+        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -1172,7 +1260,9 @@ internal class UsageBar : Control, IThemed
         Rectangle track = new Rectangle(0, 0, Width - 1, Height - 1);
         Theme.FillRound(g, track, radius, Theme.Track);
 
-        double pct = (_total > 0) ? (_used / _total) : 0;
+        // Thresholds are read off the animated value, so the colour can never turn red
+        // while the painted bar is still short of the threshold.
+        double pct = _anim.Ch(0).Value;
         if (pct < 0) pct = 0;
         if (pct > 1) pct = 1;
 
@@ -1186,6 +1276,12 @@ internal class UsageBar : Control, IThemed
             Rectangle bar = new Rectangle(0, 0, w, Height - 1);
             Theme.FillRound(g, bar, radius, fill);
         }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && _anim != null) _anim.Dispose();
+        base.Dispose(disposing);
     }
 }
 
@@ -1207,8 +1303,8 @@ internal class ActivityBar : Control, IThemed
         _timer.Interval = 28;
         _timer.Tick += delegate
         {
-            int span = Math.Max(40, Width);
-            _pos = (_pos + 7) % span;
+            int seg = Math.Max(30, Math.Max(1, Width) / 3);
+            _pos = (_pos + 7) % (Math.Max(1, Width) + seg);
             Invalidate();
         };
     }
@@ -1241,13 +1337,72 @@ internal class ActivityBar : Control, IThemed
         Rectangle track = new Rectangle(0, 0, Width - 1, Height - 1);
         Theme.FillRound(g, track, radius, Theme.Track);
 
-        int seg = Math.Max(30, Width / 3);
+        // _pos runs over [0, Width + seg): the segment starts fully off-screen on the left
+        // and only turns back once it is completely off-screen on the right, so the seam
+        // falls where nothing is visible. The old clamps parked it against an edge, which
+        // is exactly what made it pop into and out of existence.
+        int seg = Math.Max(30, Math.Max(1, Width) / 3);
         int x = _pos - seg;
-        if (x + seg > Width - 1) x = Width - 1 - seg;
-        if (x < 0) x = 0;
 
-        Rectangle bar = new Rectangle(x, 0, Math.Min(seg, Width - 1 - x), Height - 1);
+        Rectangle bar = new Rectangle(x, 0, seg, Height - 1);
         if (bar.Width > 2) Theme.FillRound(g, bar, radius, Theme.Accent);
+    }
+}
+
+// Covers the page area with a bitmap of the page that just left, fading it out over the page
+// that just arrived. It never takes mouse input: WM_NCHITTEST answers HTTRANSPARENT, so a
+// click landing during the 200ms goes to the real control underneath (plans/002-page-crossfade.md).
+internal sealed class PageFade : Control
+{
+    private readonly Bitmap _shot;
+    private readonly ImageAttributes _attributes;
+    private readonly ColorMatrix _matrix;
+    private readonly Rectangle _dst;
+    private double _alpha = 1.0;
+
+    internal PageFade(Bitmap shot)
+    {
+        _shot = shot;
+        _matrix = new ColorMatrix();
+        _attributes = new ImageAttributes();
+        _dst = new Rectangle(0, 0, shot.Width, shot.Height);
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                 ControlStyles.OptimizedDoubleBuffer, true);
+        TabStop = false;
+        Dock = DockStyle.Fill;
+    }
+
+    internal double Alpha
+    {
+        get { return _alpha; }
+        set { _alpha = value; }
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        // HTTRANSPARENT: the fade is paint, not a surface - it must never swallow a click.
+        if (m.Msg == 0x0084) { m.Result = (IntPtr)(-1); return; }
+        base.WndProc(ref m);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        float alpha = (float)Motion.Clamp01(_alpha);
+        if (alpha <= 0f) return;
+        _matrix.Matrix33 = alpha;
+        _attributes.SetColorMatrix(_matrix);
+        e.Graphics.DrawImage(_shot, _dst, 0, 0, _shot.Width, _shot.Height,
+                             GraphicsUnit.Pixel, _attributes);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _attributes.Dispose();
+            _shot.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }
 
@@ -1756,6 +1911,22 @@ internal sealed class MainForm : Form
     private Label _lblConfirm;
     private FlatButton _btnConfirmYes, _btnConfirmNo;
     private Panel _confirmStrip;
+    // ---- motion ------------------------------------------------------------
+    // One driver per animated thing, all on the tokens in Motion. The page cross-fade owns
+    // the overlay it disposes when it lands, so it keeps its own driver for that reason.
+    private MotionDriver _railAnim;
+    private bool _railAnimating;
+    private bool _railExpandTarget;
+    private int _railFrom, _railTo;
+
+    private MotionDriver _stripAnim;
+    private bool _stripAnimating;
+    private int _stripFrom, _stripTo;
+
+    private MotionDriver _pageAnim;
+    private PageFade _pageFade;
+
+    private Panel _body;
 
     private ToolTip _tips;
     private LogWindow _logWindow;
@@ -1815,6 +1986,15 @@ internal sealed class MainForm : Form
         _powershell = ResolvePowerShell();
 
         BuildLayout();
+
+        // Motion drivers attach to controls the layout builds, so they are created after it.
+        // An idle driver costs nothing: its timer runs only while a value is travelling.
+        _railAnim = new MotionDriver(_rail, 1);
+        _railAnim.Tick += delegate { RailStep(); };
+        _stripAnim = new MotionDriver(_confirmStrip, 1);
+        _stripAnim.Tick += delegate { StripStep(); };
+        _pageAnim = new MotionDriver(this, 1);
+        _pageAnim.Tick += delegate { PageStep(); };
 
         // Paint everything from the active palette before the window is shown. The same
         // pass runs on every theme change, so "first paint" is not a special case.
@@ -1913,6 +2093,7 @@ internal sealed class MainForm : Form
         Panel body = new Panel();
         body.Dock = DockStyle.Fill;
         Role(body, "bg");
+        _body = body;
 
         BuildRail();
         _pageHost = new Panel();
@@ -2167,23 +2348,87 @@ internal sealed class MainForm : Form
 
     private void ToggleRail()
     {
-        Settings.RailExpanded = !Settings.RailExpanded;
-        ApplyRailState();
+        bool expanded = !Settings.RailExpanded;
+        Settings.RailExpanded = expanded;   // the setting lands at once; the slide is cosmetic
+        _railExpandTarget = expanded;
+
+        if (_railAnim == null || Motion.Reduced || _rail == null || _railButtons == null)
+        {
+            ApplyRailState();
+            return;
+        }
+
+        _railFrom = _rail.Width;
+        _railTo = expanded ? 292 : 64;
+        if (_railFrom == _railTo)
+        {
+            ApplyRailState();
+            return;
+        }
+
+        // Collapsing flips the items to number chips immediately - they are centred, so they
+        // slide left with the narrowing rail - and shortens the toggle caption at the same
+        // time so it is never clipped. Expanding waits for the width to come back before the
+        // titles return, otherwise they would be squeezed into ellipses on the way out.
+        _railAnimating = true;
+        if (!expanded)
+        {
+            SetRailCollapsed(true);
+            SyncRailItems();
+            _btnRailToggle.Text = "☰";
+        }
+
+        _railAnim.Move(0, 1.0, Motion.DurRail, Ease.InOut);
+        if (!_railAnim.Busy)
+        {
+            _railAnimating = false;
+            ApplyRailState();
+        }
+    }
+
+    private void RailStep()
+    {
+        if (!_railAnimating || _rail == null) return;
+
+        double t = _railAnim.Ch(0).Value;
+        if (_body != null) _body.SuspendLayout();
+        _rail.Width = (int)Math.Round(_railFrom + (_railTo - _railFrom) * t);
+        SyncRailItems();
+        if (_body != null) _body.ResumeLayout(false);
+
+        if (t >= 1.0)
+        {
+            _railAnimating = false;
+            ApplyRailState();       // authoritative finish, including the titles coming back
+        }
     }
 
     private void ApplyRailState()
     {
+        if (_railAnimating) return;         // the slide owns the width right now
+
         bool expanded = Settings.RailExpanded;
         _rail.Width = expanded ? 292 : 64;
         _btnRailToggle.Text = expanded ? "☰  折叠功能栏" : "☰";
-        if (_railButtons != null)
+        SetRailCollapsed(!expanded);
+        SyncRailItems();
+    }
+
+    private void SetRailCollapsed(bool collapsed)
+    {
+        if (_railButtons == null) return;
+        for (int i = 0; i < _railButtons.Length; i++) _railButtons[i].SetCollapsed(collapsed);
+    }
+
+    // Item widths follow whatever width the panel has at this instant. Split out of
+    // ApplyRailState because the slide re-runs it on every frame (plans/006-rail-slide.md).
+    private void SyncRailItems()
+    {
+        if (_railButtons == null || _railItems == null) return;
+        for (int i = 0; i < _railButtons.Length; i++)
         {
-            for (int i = 0; i < _railButtons.Length; i++)
-            {
-                _railButtons[i].SetCollapsed(!expanded);
-                _railButtons[i].Width = Math.Max(40, _railItems.ClientSize.Width - 6);
-                _railButtons[i].Invalidate();
-            }
+            _railButtons[i].Width = Math.Max(40, _railItems.ClientSize.Width - 6);
+            _railButtons[i].Invalidate();
         }
     }
 
@@ -2193,6 +2438,28 @@ internal sealed class MainForm : Form
 
         ToolPage previous = CurrentPage;
         _current = index;
+
+        // Snapshot the outgoing page BEFORE the visibility swap - afterwards DrawToBitmap has
+        // nothing to draw. Skipped while a fade is already running, so clicking down the rail
+        // cannot pile up bitmaps.
+        Bitmap leaving = null;
+        if (previous != null && previous != _pages[index] && _pageFade == null)
+        {
+            Control old = previous.View;
+            try
+            {
+                if (old.Width > 0 && old.Height > 0)
+                {
+                    leaving = new Bitmap(old.Width, old.Height);
+                    old.DrawToBitmap(leaving, new Rectangle(0, 0, old.Width, old.Height));
+                }
+            }
+            catch (Exception)
+            {
+                // A page that will not be captured simply switches without a cross-fade.
+                if (leaving != null) { leaving.Dispose(); leaving = null; }
+            }
+        }
 
         for (int i = 0; i < _pages.Length; i++)
         {
@@ -2208,6 +2475,37 @@ internal sealed class MainForm : Form
         _pages[index].View.BringToFront();
         UpdateRunButton();
         SetBusy(_proc != null || _pages[index].Busy, null);
+
+        if (leaving != null) StartPageFade(leaving);
+    }
+
+    // The outgoing page fades out over the incoming one, so the window never shows a blank
+    // frame between two pages (plans/002-page-crossfade.md).
+    private void StartPageFade(Bitmap shot)
+    {
+        if (_pageAnim == null || _pageHost == null)
+        {
+            shot.Dispose();
+            return;
+        }
+        _pageFade = new PageFade(shot);
+        _pageHost.Controls.Add(_pageFade);
+        _pageFade.BringToFront();
+        _pageAnim.Snap(0, 1.0);
+        _pageAnim.Feedback(0, 0.0, Motion.DurPage, Ease.Out);
+    }
+
+    private void PageStep()
+    {
+        if (_pageFade == null) return;
+        _pageFade.Alpha = _pageAnim.Ch(0).Value;
+        _pageFade.Invalidate();
+        if (_pageFade.Alpha <= 0.001)
+        {
+            _pageHost.Controls.Remove(_pageFade);
+            _pageFade.Dispose();
+            _pageFade = null;
+        }
     }
 
     private void CreatePages()
@@ -2329,6 +2627,68 @@ internal sealed class MainForm : Form
         _confirmCard.Controls.Add(buttons);
         _confirmStrip.Controls.Add(_confirmCard);
         return _confirmStrip;
+    }
+
+    // The strip is the last thing between the user and a delete, so it slides up instead of
+    // jumping: everything above it is pushed up continuously (plans/007-confirm-reveal.md).
+    private void ShowConfirmStrip(bool show)
+    {
+        if (Motion.Reduced || _stripAnim == null)
+        {
+            _stripAnimating = false;
+            _confirmStrip.Height = show ? 78 : 0;
+            _confirmStrip.Visible = show;
+            return;
+        }
+
+        if (show)
+        {
+            if (_confirmStrip.Visible && _confirmStrip.Height == 78) return;
+            _stripFrom = _confirmStrip.Visible ? _confirmStrip.Height : 0;
+            _stripTo = 78;
+            _confirmStrip.Height = _stripFrom;   // start exactly where the tween says it starts
+            _confirmStrip.Visible = true;        // reveal at 0 height: no jump
+        }
+        else
+        {
+            // Already hidden: keep the full height as the start point for the next reveal.
+            if (!_confirmStrip.Visible) { _confirmStrip.Height = 78; return; }
+            _stripFrom = _confirmStrip.Height;
+            _stripTo = 0;
+        }
+
+        if (_stripFrom == _stripTo)
+        {
+            _confirmStrip.Height = _stripTo;
+            if (!show) _confirmStrip.Visible = false;
+            return;
+        }
+
+        _stripAnimating = true;
+        _stripAnim.Move(0, 1.0, show ? Motion.DurPanel : 140, Ease.Out);
+        if (!_stripAnim.Busy)
+        {
+            _stripAnimating = false;
+            _confirmStrip.Height = _stripTo;
+            if (!show) _confirmStrip.Visible = false;
+        }
+    }
+
+    private void StripStep()
+    {
+        if (!_stripAnimating) return;
+
+        double t = _stripAnim.Ch(0).Value;
+        SuspendLayout();
+        _confirmStrip.Height = (int)Math.Round(_stripFrom + (_stripTo - _stripFrom) * t);
+        ResumeLayout(false);
+
+        if (t >= 1.0)
+        {
+            _stripAnimating = false;
+            _confirmStrip.Height = _stripTo;
+            if (_stripTo <= 0) _confirmStrip.Visible = false;
+        }
     }
 
     private FlatButton MakeGhost(string text, int w, int h)
@@ -2625,7 +2985,26 @@ internal sealed class MainForm : Form
             _themeMenu.Items.Add(it);
         }
 
+        _themeMenu.Items.Add(new ToolStripSeparator());
+
+        // The animations follow Windows by default, and Windows is often set to no
+        // animations at all - in which case the window would move instantly with nothing
+        // on screen saying why. This is where that is answered.
+        _themeMenu.Items.Add(SectionItem("动效"));
+        AddMotionItem("auto");
+        AddMotionItem("on");
+        AddMotionItem("off");
+
         _themeMenu.Show(_btnTheme, new Point(0, _btnTheme.Height + 4));
+    }
+
+    private void AddMotionItem(string value)
+    {
+        ToolStripMenuItem it = new ToolStripMenuItem(Motion.Label(value));
+        it.Tag = "motion:" + value;
+        it.Checked = (Motion.Preference == value);
+        it.Click += new EventHandler(OnThemeMenuItemClick);
+        _themeMenu.Items.Add(it);
     }
 
     private static ToolStripMenuItem SectionItem(string text)
@@ -2654,6 +3033,13 @@ internal sealed class MainForm : Form
         string tag = Convert.ToString(((ToolStripMenuItem)sender).Tag);
         if (tag.StartsWith("mode:")) Theme.SetMode(tag.Substring(5));
         else if (tag.StartsWith("accent:")) Theme.SetAccent(tag.Substring(7));
+        else if (tag.StartsWith("motion:"))
+        {
+            Motion.SetPreference(tag.Substring(7));
+            Log.Append("[外观] 动效：" + Motion.Label(Motion.Preference) +
+                       (Motion.Reduced ? "（切换与移动立即完成）" : "（切换与移动带动画）"));
+            return;
+        }
         else return;
 
         // Selecting "follow system" (or any mode) re-syncs the cached OS state, so the
@@ -3084,7 +3470,7 @@ internal sealed class MainForm : Form
         if (_pending == null || _proc != null) return;
         PendingRun run = _pending;
         _pending = null;
-        _confirmStrip.Visible = false;
+        ShowConfirmStrip(false);
         Log.Append("");
         Log.Append(">>> 用户已确认，开始真正执行（-Execute）。");
         RunScript(run, true);
@@ -3093,7 +3479,7 @@ internal sealed class MainForm : Form
     private void OnConfirmNoClick(object sender, EventArgs e)
     {
         _pending = null;
-        _confirmStrip.Visible = false;
+        ShowConfirmStrip(false);
         Log.Append(">>> 已取消，未删除任何文件。");
         SetBusy(false, "就绪");
     }
@@ -3137,7 +3523,7 @@ internal sealed class MainForm : Form
         _running = run;
         _cancelRequested = false;
         _pending = null;
-        _confirmStrip.Visible = false;
+        ShowConfirmStrip(false);
         _runStarted = DateTime.Now;
         _runSeconds = 0;
 
@@ -3353,7 +3739,7 @@ internal sealed class MainForm : Form
             // report the dry run wrote, not re-derived from the log text.
             string measured = DryRunSummary(run);
             _lblConfirm.Text = measured == null ? sentence : (measured + "\r\n" + sentence);
-            _confirmStrip.Visible = true;
+        ShowConfirmStrip(true);
             SetBusy(false, "等待确认：预演已完成，未删除任何文件");
         }
         else if (cancelled)
