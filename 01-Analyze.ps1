@@ -247,7 +247,7 @@ $report = [ordered]@{
     TargetMB   = [math]::Round($grand / 1MB, 1)
     TopDirs    = @($top)
 }
-$report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $RepFile -Encoding UTF8
+$report | ConvertTo-Json -Depth 6 | ForEach-Object { $null = Write-ReportText -Path $RepFile -Text $_ }
 
 Write-Output ''
 Write-Output '=================================================================='

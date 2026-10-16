@@ -121,11 +121,89 @@ function Get-FreeGB {
 function Get-PathBytes {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return [int64]0 }
+
+    # WHY NOT Get-ChildItem -Recurse (measured, 2026-10-16)
+    #
+    # On C:\Windows\SoftwareDistribution\Download (309,730 files) Get-ChildItem -Recurse
+    # -Force -File costs 16.1 s PER CALL, and the dry run called this twice per target.
+    # DirectoryInfo.GetFileSystemInfos() walks the same tree in ~2 s, and summing while
+    # walking costs nothing extra because no FileInfo is handed to the caller.
+    #
+    # Reparse points are NOT followed. That also matches the rule the deletion engine
+    # already follows: Get-ChildItem -Recurse in Windows PowerShell 5.1 walks straight into
+    # junctions, which double-counts a subtree and can loop.
     $sum = [int64]0
-    foreach ($f in (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue)) {
-        $sum += $f.Length
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($Path)
+    while ($stack.Count -gt 0) {
+        $cur = [string]$stack.Pop()
+        $di = $null
+        try { $di = New-Object System.IO.DirectoryInfo($cur) } catch { continue }
+        $entries = $null
+        try { $entries = $di.GetFileSystemInfos() } catch { continue }
+
+        foreach ($e in $entries) {
+            $attr = $e.Attributes
+            if (($attr -band [IO.FileAttributes]::Directory) -ne 0) {
+                if (($attr -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push($e.FullName) }
+            } else {
+                $sum += [int64]$e.Length
+            }
+        }
     }
     return $sum
+}
+
+<#
+  Subtree size of EVERY directory under $Path, in ONE traversal.
+
+  Why this exists: Remove-TargetGuarded used to call Get-PathBytes once per selected
+  directory child. On SoftwareDistribution\Download (51 directory children) that was
+  29.4 s of the 53 s the target took. The same walk also yields the target's own total, so
+  BeforeMB no longer needs a separate traversal either.
+
+  Returns a Dictionary[dir, bytes] that contains $Path itself. Reparse points are not
+  followed, so a junction is neither counted nor descended into.
+#>
+function Get-DirSizes {
+    param([Parameter(Mandatory)][string]$Path)
+    $map = New-Object 'System.Collections.Generic.Dictionary[string,int64]' ([StringComparer]::OrdinalIgnoreCase)
+
+    # Resolve to the long form before walking. DirectoryInfo.FullName yields names such as
+    # C:\Users\Administrator\... while the caller may have handed us the 8.3 short form
+    # (C:\Users\ADMINI~1\...); mixing the two shapes makes lookups miss silently, which the
+    # test suite caught. The caller's own spelling of the root stays usable as an alias.
+    $resolved = $Path
+    try { $resolved = (New-Object System.IO.DirectoryInfo($Path)).FullName } catch { }
+    [void](Get-DirSizeInto -Dir $resolved -Map $map)
+    if ($resolved -ne $Path -and $map.ContainsKey($resolved)) { $map[$Path] = $map[$resolved] }
+
+    return $map
+}
+
+function Get-DirSizeInto {
+    param([string]$Dir, $Map)
+    $total = [int64]0
+    $di = $null
+    try { $di = New-Object System.IO.DirectoryInfo($Dir) } catch { return 0 }
+
+    $entries = $null
+    try { $entries = $di.GetFileSystemInfos() } catch { }
+
+    if ($entries) {
+        foreach ($e in $entries) {
+            $attr = $e.Attributes
+            if (($attr -band [IO.FileAttributes]::Directory) -ne 0) {
+                if (($attr -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                $total += Get-DirSizeInto -Dir $e.FullName -Map $Map
+            } else {
+                $total += [int64]$e.Length
+            }
+        }
+    }
+
+    $Map[$Dir] = $total
+    return $total
 }
 
 function Get-DirSizeMB { param([string]$Path) return [math]::Round((Get-PathBytes -Path $Path) / 1MB, 1) }
@@ -274,7 +352,11 @@ function Get-ShadowStorageInfo {
 $script:NetGuard = $null
 
 function Start-NetGainGuard {
-    param([string]$Drive = 'C:')
+    param(
+        [string]$Drive = 'C:',
+        [double]$NoiseFloorMB = 32,
+        [double]$NoisePerMinMB = 8
+    )
     $shadow = Get-ShadowStorageInfo -Drive $Drive
     $script:NetGuard = [ordered]@{
         Drive         = $Drive.TrimEnd(':').ToUpper()
@@ -284,11 +366,19 @@ function Start-NetGainGuard {
         StartShadow   = [int64]$shadow.UsedBytes
         ShadowAtStart = $shadow
         StartTime     = Get-Date
+        LastStepTime  = (Get-Date)
         Steps         = (New-Object System.Collections.ArrayList)
         Regressions   = (New-Object System.Collections.ArrayList)
         Aborted       = $false
         AbortReason   = ''
         MaxDropMB     = 0
+        # Noise floor. Measured on this machine with NOTHING running: C: free space jitters by
+        # ~4 MB in 30 s and drifts ~7 MB/min (436 MB/hour) from Defender, telemetry and
+        # browsers alone. A verdict built on a smaller number than that describes the
+        # background, not the cleanup - one real run aborted every remaining target over a
+        # 3.5 MB whole-run change, which is less than half a minute of this volume's own noise.
+        NoiseFloorMB  = $NoiseFloorMB
+        NoisePerMinMB = $NoisePerMinMB
     }
     $script:NetGuard.CurrentFree = $script:NetGuard.StartFree
     return $script:NetGuard
@@ -304,22 +394,43 @@ function Step-NetGainGuard {
     param(
         [string]$Label = '',
         [switch]$AbortIfNegative,
-        [double]$ToleranceMB = 0
+        [double]$ToleranceMB = 0,
+        [int]$RemovedItems = -1        # -1 = unknown, 0 = this step removed nothing at all
     )
-    if (-not $script:NetGuard) { return $false }
-    $free  = Get-FreeBytes -Drive $script:NetGuard.Drive
-    $delta = $free - [int64]$script:NetGuard.CurrentFree
-    $script:NetGuard.CurrentFree = $free
-    [void]$script:NetGuard.Steps.Add((New-Object psobject -Property ([ordered]@{
+    $g = $script:NetGuard
+    if (-not $g) { return $false }
+    $free  = Get-FreeBytes -Drive $g.Drive
+    $delta = $free - [int64]$g.CurrentFree
+    $g.CurrentFree = $free
+
+    $stepMinutes = ((Get-Date) - $g.LastStepTime).TotalMinutes
+    if ($stepMinutes -lt 0) { $stepMinutes = 0 }
+    $g.LastStepTime = Get-Date
+
+    [void]$g.Steps.Add((New-Object psobject -Property ([ordered]@{
         Label = $Label; DeltaMB = [math]::Round($delta / 1MB, 1); Time = (Get-Date).ToString('HH:mm:ss')
     })))
+
     if ($delta -lt 0) {
         $mb = [math]::Round($delta / 1MB, 1)
-        if ([math]::Abs($mb) -gt $script:NetGuard.MaxDropMB) { $script:NetGuard.MaxDropMB = [math]::Abs($mb) }
-        [void]$script:NetGuard.Regressions.Add(("{0}: {1:N1} MB" -f $Label, $mb))
-        if ($AbortIfNegative -and ([math]::Abs($mb) -gt $ToleranceMB)) {
-            $script:NetGuard.Aborted = $true
-            $script:NetGuard.AbortReason = ("free space fell {0:N1} MB during '{1}' (tolerance {2} MB)" -f $mb, $Label, $ToleranceMB)
+        if ([math]::Abs($mb) -gt $g.MaxDropMB) { $g.MaxDropMB = [math]::Abs($mb) }
+        [void]$g.Regressions.Add(("{0}: {1:N1} MB" -f $Label, $mb))
+
+        # The tolerance is a floor plus a rate: a step that took three minutes is allowed the
+        # three minutes' worth of writes that other processes did during it.
+        $eff = [double]$g.NoiseFloorMB
+        if ($ToleranceMB -gt $eff) { $eff = $ToleranceMB }
+        $scaled = [double]$g.NoisePerMinMB * $stepMinutes
+        if ($scaled -gt $eff) { $eff = $scaled }
+
+        # Attribution. If this step removed nothing, a fall in free space cannot be its doing -
+        # that is exactly the update-cache case here: every delete was denied, so the target
+        # freed zero bytes while other writers kept going, and the run was stopped for it.
+        $attributable = ($RemovedItems -ne 0)
+
+        if ($AbortIfNegative -and $attributable -and ([math]::Abs($mb) -gt $eff)) {
+            $g.Aborted = $true
+            $g.AbortReason = ("free space fell {0:N1} MB during '{1}' after removing items (noise floor {2:N0} MB over {3:N1} min)" -f $mb, $Label, $eff, $stepMinutes)
         }
         return $true
     }
@@ -335,15 +446,29 @@ function Stop-NetGainGuard {
     $netFree = $free - [int64]$g.StartFree
     $netUsed = (Get-UsedBytes -Drive $g.Drive) - [int64]$g.StartUsed
     $shadowGrowth = [int64]$shadow.UsedBytes - [int64]$g.StartShadow
+
+    # The whole-run verdict gets the same noise floor, scaled by how long the run took. Below
+    # it the volume's own writers dominate, and the honest answer is "unmeasurable", not "the
+    # guarantee broke".
+    $runMinutes = ((Get-Date) - $g.StartTime).TotalMinutes
+    if ($runMinutes -lt 0) { $runMinutes = 0 }
+    $eff = [double]$g.NoiseFloorMB
+    $scaled = [double]$g.NoisePerMinMB * $runMinutes
+    if ($scaled -gt $eff) { $eff = $scaled }
+
     $verdict = 'GAIN'
     if ($netFree -lt 0) { $verdict = 'REGRESSION' }
     elseif ($netFree -eq 0) { $verdict = 'NEUTRAL' }
+    if ($verdict -eq 'REGRESSION' -and ([math]::Abs($netFree / 1MB) -le $eff)) { $verdict = 'NEUTRAL' }
+
     return New-Object psobject -Property ([ordered]@{
         Drive = $g.Drive
         FreeStartGB = [math]::Round([int64]$g.StartFree / 1GB, 2)
         FreeEndGB   = [math]::Round($free / 1GB, 2)
         NetFreeMB   = [math]::Round($netFree / 1MB, 1)
         NetUsedMB   = [math]::Round($netUsed / 1MB, 1)
+        NoiseFloorMB = [math]::Round($eff, 1)
+        RunMinutes   = [math]::Round($runMinutes, 2)
         ShadowGrowthMB = [math]::Round($shadowGrowth / 1MB, 1)
         ShadowUsedGB   = [math]::Round([int64]$shadow.UsedBytes / 1GB, 2)
         ShadowMaxGB    = [math]::Round([int64]$shadow.MaxBytes / 1GB, 2)
@@ -518,12 +643,84 @@ function Remove-EmptySubdirs {
 }
 
 # --------------------------------------------------------------- the one deleter
+$script:SkipLogBuffer = New-Object System.Collections.ArrayList
+
+<#
+  Writes a report file without ever truncating the live one.
+
+  WHY: the window shell keeps the report it is displaying open for reading, so a plain
+  Set-Content on reports\system.json fails outright. Measured at the end of a real -Execute
+  run: Set-Content : access to "...\runtime\reports\system.json" was denied - the run lost its
+  numbers and the GUI had nothing to show. Writing a fresh file and swapping works because
+  the reader's handle is on the OLD file; if even the swap is denied, a timestamped name is
+  used so the numbers are never lost.
+#>
+function Write-ReportText {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text
+    )
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        try { New-Item -ItemType Directory -Path $dir -Force | Out-Null } catch { }
+    }
+
+    $tmp = "$Path.new"
+    try {
+        Set-Content -LiteralPath $tmp -Value $Text -Encoding UTF8 -ErrorAction Stop
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+        return $Path
+    } catch {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+
+    $alt = Join-Path $dir ("{0}-{1}{2}" -f [System.IO.Path]::GetFileNameWithoutExtension($Path),
+                                          (Get-Date -Format 'HHmmss'),
+                                          [System.IO.Path]::GetExtension($Path))
+    try {
+        Set-Content -LiteralPath $alt -Value $Text -Encoding UTF8 -ErrorAction Stop
+        Write-Warn2 ("report was locked; wrote {0} instead" -f $alt)
+        return $alt
+    } catch { return $null }
+}
+
 function Add-SkipLog {
     param([string]$Line)
     if ([string]::IsNullOrWhiteSpace($Line)) { return }
-    $dir = Join-Path $PSScriptRoot 'reports'
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    Add-Content -Path (Join-Path $dir 'skipped.log') -Value $Line -ErrorAction SilentlyContinue
+    if (-not $script:SkipLogBuffer) { $script:SkipLogBuffer = New-Object System.Collections.ArrayList }
+    [void]$script:SkipLogBuffer.Add($Line)
+    if ($script:SkipLogBuffer.Count -ge 500) { Flush-SkipLog }
+}
+
+# Why buffered: every skipped item used to be its own Add-Content call. This machine ended up
+# with a 78 MB / 344,131-line skipped.log, i.e. hundreds of thousands of open/append/close
+# cycles during one run. Batches of 500 keep the record intact and the run fast.
+#
+# Why UTF-8: Add-Content without an explicit encoding writes the ANSI code page, so every
+# Chinese error message came back as mojibake when the GUI read the file
+# (an access-denied message rendered as "??-??..."). The log is a user-facing record; it has
+# to be readable.
+function Flush-SkipLog {
+    if (-not $script:SkipLogBuffer -or $script:SkipLogBuffer.Count -eq 0) { return }
+    try {
+        $dir = Join-Path $PSScriptRoot 'reports'
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $path = Join-Path $dir 'skipped.log'
+
+        # Rotate. A single bad target can produce hundreds of thousands of lines: this machine
+        # reached 78 MB in one afternoon, and a log that big is a bug of its own. One previous
+        # file is kept.
+        if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -gt 16MB) {
+            $old = "$path.1"
+            if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue }
+            Move-Item -LiteralPath $path -Destination $old -Force -ErrorAction SilentlyContinue
+        }
+
+        Add-Content -LiteralPath $path -Value $script:SkipLogBuffer.ToArray() `
+                    -Encoding UTF8 -ErrorAction SilentlyContinue
+    } catch { }
+    $script:SkipLogBuffer.Clear()
 }
 
 <#
@@ -618,13 +815,51 @@ function Remove-TargetGuarded {
     }
     $res.SelectedItems = $selected.Count
 
-    $selBytes = [int64]0
+    # ---- ONE traversal for every size we need ------------------------------
+    # Before this, every selected directory child cost its own full Get-PathBytes walk
+    # (51 of them on SoftwareDistribution\Download = 29.4 s) and BeforeMB cost another.
+    $dirSizes = Get-DirSizes -Path $Path
+    $rootBytes = [int64]0
+    if ($dirSizes.ContainsKey($Path)) { $rootBytes = $dirSizes[$Path] }
+
+    # ---- the deletion set is the TOP-MOST selection ------------------------
+    # In 'children' mode the enumeration returns a directory AND everything inside it, so a
+    # file under a selected directory was selected twice. That inflated every size by the
+    # depth of the tree - measured on this machine: a 2,806 MB directory reported as
+    # "10,092.6 MB selected", and a 6,882 MB one as "13,764.6 MB" (exactly 2x). It also made
+    # real runs log the files inside an already-removed directory as LOCKED, i.e. thousands
+    # of phantom failures in skipped.log.
+    #
+    # 'files' mode passes -FilesOnly, so it has no selected directories and $top is $selected.
+    $selDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($it in $selected) {
-        if (($it.Attributes -band [IO.FileAttributes]::Directory) -ne 0) { $selBytes += Get-PathBytes -Path $it.FullName }
-        else { $selBytes += [int64]$it.Length }
+        if (($it.Attributes -band [IO.FileAttributes]::Directory) -ne 0) { [void]$selDirs.Add($it.FullName) }
+    }
+
+    if ($selDirs.Count -eq 0) {
+        $top = $selected
+    } else {
+        $built = New-Object System.Collections.ArrayList
+        foreach ($it in $selected) {
+            $parent = [System.IO.Path]::GetDirectoryName($it.FullName)
+            if (-not [string]::IsNullOrEmpty($parent) -and $selDirs.Contains($parent)) { continue }
+            [void]$built.Add($it)
+        }
+        $top = @($built)
+    }
+
+    $selBytes = [int64]0
+    foreach ($it in $top) {
+        if (($it.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+            $sz = [int64]0
+            if ($dirSizes.ContainsKey($it.FullName)) { $sz = $dirSizes[$it.FullName] }
+            $selBytes += $sz
+        } else {
+            $selBytes += [int64]$it.Length
+        }
     }
     $res.SelectedMB = [math]::Round($selBytes / 1MB, 1)
-    $res.BeforeMB   = [math]::Round((Get-PathBytes -Path $Path) / 1MB, 1)
+    $res.BeforeMB   = [math]::Round($rootBytes / 1MB, 1)
 
     if (-not $Execute) {
         # A dry run reports the SELECTION only. It must never promise free-space
@@ -635,13 +870,19 @@ function Remove-TargetGuarded {
         # while a handle remains open (delete-pending). That is why 182 MB of
         # C:\Windows\SystemTemp measured here shrank to 0.2 MB on a real run.
         # Each selected file is therefore probed for exclusive access.
+        # $top, not $selected: these are the items a real run would remove, and their sizes
+        # come out of the same map the selection used. Iterating the raw selection counted a
+        # nested directory's subtree once per ancestor level, which is how "probably free"
+        # could come out NEGATIVE (measured: -6,882.0 MB of 6,882.3 MB selected).
         $lockedBytes = [int64]0; $lockedCount = 0; $probed = 0; $lockedDirs = 0
-        foreach ($it in $selected) {
+        foreach ($it in $top) {
             if (($it.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
                 # a directory cannot be probed directly; sample the files inside
                 if (Test-DirContainsLockedFiles -Path $it.FullName -MaxProbe 20) {
                     $lockedDirs++
-                    $lockedBytes += Get-PathBytes -Path $it.FullName
+                    $sz = [int64]0
+                    if ($dirSizes.ContainsKey($it.FullName)) { $sz = $dirSizes[$it.FullName] }
+                    $lockedBytes += $sz
                 }
                 continue
             }
@@ -656,7 +897,9 @@ function Remove-TargetGuarded {
         $res.LockedPredicted = $lockedCount + $lockedDirs
         $res.FreedMB         = $res.SelectedMB
         $res.EstimatedMB     = [math]::Round(($selBytes - $lockedBytes) / 1MB, 1)
-        $res.AfterMB         = [math]::Round((Get-PathBytes -Path $Path) / 1MB, 1)
+        # A dry run deletes nothing, so "after" equals "before" by definition. Walking the
+        # tree a second time to prove that cost ~16 s per target on the update cache.
+        $res.AfterMB         = $res.BeforeMB
         return $res
     }
 
@@ -667,7 +910,9 @@ function Remove-TargetGuarded {
     if (-not $SkipHardlinkProbe -and $MaxHardlinkProbe -gt 0) {
         $budget = $MaxHardlinkProbe
         $kept   = New-Object System.Collections.ArrayList
-        foreach ($it in $selected) {
+        # $top, not $selected: anything nested under a selected directory is removed WITH
+        # that directory, so probing or listing it separately is wasted work.
+        foreach ($it in $top) {
             $isDir = (($it.Attributes -band [IO.FileAttributes]::Directory) -ne 0)
             if ($isDir -or $budget -le 0 -or [int64]$it.Length -lt $HardlinkProbeMinBytes) {
                 [void]$kept.Add($it); continue
@@ -682,30 +927,71 @@ function Remove-TargetGuarded {
             }
             [void]$kept.Add($it)
         }
-        $selected = @($kept)
+        $top = @($kept)
     }
 
     # ---- delete ------------------------------------------------------------
-    foreach ($it in $selected) {
+    # $top: one Remove-Item -Recurse per top-most item, so files inside a removed directory
+    # are never touched individually (that is what used to fill skipped.log with phantom locks).
+    #
+    # BUT a recursive delete is all-or-nothing: ONE file held open inside a tree fails the
+    # whole subtree and frees nothing. Measured on this machine - Windows Update's services
+    # hold files under SoftwareDistribution\Download, every top-level GUID directory came back
+    # "access denied", the target freed 0 bytes while other processes kept writing, and the
+    # net-gain guard then reported that C: used space GREW. So when the tree delete fails,
+    # fall back to taking the files one at a time: that is what the old per-file loop did, and
+    # it is the difference between freeing most of a cache and freeing none of it.
+    foreach ($it in $top) {
         if (($it.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             $res.ReparseSkipped++
             Add-SkipLog ("REPARSE-SKIPPED`t{0}" -f $it.FullName)
             continue
         }
+
+        $isDir = (($it.Attributes -band [IO.FileAttributes]::Directory) -ne 0)
         try {
-            if (($it.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
-                Remove-Item -LiteralPath $it.FullName -Recurse -Force -ErrorAction Stop
-            } else {
-                Remove-Item -LiteralPath $it.FullName -Force -ErrorAction Stop
-            }
+            if ($isDir) { Remove-Item -LiteralPath $it.FullName -Recurse -Force -ErrorAction Stop }
+            else        { Remove-Item -LiteralPath $it.FullName -Force -ErrorAction Stop }
             $res.ItemsGone++
+            continue
         } catch {
-            $res.Locked++
-            $line = ("LOCKED`t{0}`t{1}" -f $it.FullName, $_.Exception.Message)
-            [void]$script:Failures.Add($line)
-            Add-SkipLog $line
+            if (-not $isDir) {
+                $res.Locked++
+                $line = ("LOCKED`t{0}`t{1}" -f $it.FullName, $_.Exception.Message)
+                [void]$script:Failures.Add($line)
+                Add-SkipLog $line
+                continue
+            }
+            Add-SkipLog ("TREE-FAILED`t{0}`t{1}" -f $it.FullName, $_.Exception.Message)
         }
+
+        $denied = 0
+        foreach ($f in @(Get-TreeEntries -Path $it.FullName -FilesOnly)) {
+            try {
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                $res.ItemsGone++
+                $denied = 0
+            } catch {
+                $res.Locked++
+                $denied++
+                $line = ("LOCKED`t{0}`t{1}" -f $f.FullName, $_.Exception.Message)
+                [void]$script:Failures.Add($line)
+                Add-SkipLog $line
+
+                # Safety valve: when a whole tree is denied item by item, something is holding
+                # it (Windows Update / Delivery Optimization still running). Grinding through
+                # 300,000 files that all fail is what turned one target into a 20-minute run
+                # and a 78 MB log, and it frees nothing. Give up on this tree and say why.
+                if ($denied -ge 200) {
+                    Add-SkipLog ("TREE-ABANDONED`t{0}`t{1} consecutive denials - the service holding this cache is most likely still running" -f $it.FullName, $denied)
+                    break
+                }
+            }
+        }
+        # take the directories that are empty now (fails harmlessly while anything is left)
+        try { Remove-Item -LiteralPath $it.FullName -Recurse -Force -ErrorAction Stop } catch { }
     }
+    Flush-SkipLog
 
     if ($Mode -eq 'files') { $res.PrunedDirs = Remove-EmptySubdirs -Path $Path }
 
@@ -948,6 +1234,7 @@ function Show-Summary {
         [switch]$DryRun,
         $NetGuard
     )
+    Flush-SkipLog    # never lose the tail of the skipped-item record
     Write-Host ''
     Write-Host '=================================================================='
     Write-Host (" {0}" -f $Title)
@@ -1021,6 +1308,26 @@ function Show-Summary {
     $fails = Get-Failures
     if ($fails.Count -gt 0) {
         Write-Warn2 ("{0} item(s) were locked / in use and were SKIPPED (see reports\skipped.log)" -f $fails.Count)
+        # Say WHICH target - and therefore which program - is holding them. A run that selects
+        # gigabytes and reclaims nothing is useless unless it tells the user what to close.
+        # Measured here: 20,080 denials, 8,370 of them Edge's cache, 5,312 the 360 browser's,
+        # 4,984 the user Temp: the files were open in running programs, not ACL-protected.
+        $pathList = @($Rows | Where-Object { $_.Path } | ForEach-Object { $_.Path } | Sort-Object Length -Descending)
+        $byTarget = @{}
+        foreach ($line in $fails) {
+            $p = ($line -split "`t")[1]
+            if (-not $p) { continue }
+            $key = 'other'
+            foreach ($rp in $pathList) {
+                if ($p.StartsWith($rp, [System.StringComparison]::OrdinalIgnoreCase)) { $key = $rp; break }
+            }
+            if ($byTarget.ContainsKey($key)) { $byTarget[$key]++ } else { $byTarget[$key] = 1 }
+        }
+        $byTarget.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5 | ForEach-Object {
+            Write-Host ("     {0,6}  {1}" -f $_.Value, $_.Key)
+        }
+        Write-Warn2 'These are held by programs that are RUNNING (browsers and download managers are'
+        Write-Warn2 'the usual ones). Close them and run again to actually reclaim the space.'
     }
     Write-Host '=================================================================='
 
@@ -1047,7 +1354,7 @@ function Show-Summary {
         $repObj.Verdict = $verdict
     }
     if ($NetGuard) { $repObj.NetGuard = $NetGuard }
-    $repObj | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $rep -Encoding UTF8
+    $repObj | ConvertTo-Json -Depth 8 | ForEach-Object { $null = Write-ReportText -Path $rep -Text $_ }
     Write-Host ("   report -> {0}" -f $rep)
     if ($DryRun) { return [math]::Round($tot, 1) }
     return [math]::Round($netTot, 1)

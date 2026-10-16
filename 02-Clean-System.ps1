@@ -204,7 +204,7 @@ if ($Discover) {
         Time = (Get-Date).ToString('o'); Mode = 'read-only discovery'
         MinMB = $DiscoverMinMB; Found = @($found); Leftovers = @($leftovers)
         TotalFoundMB = [math]::Round((($found | Measure-Object MB -Sum).Sum), 1)
-    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $rep -Encoding UTF8
+    } | ConvertTo-Json -Depth 6 | ForEach-Object { $null = Write-ReportText -Path $rep -Text $_ }
     Write-Host ("`n   report -> {0}" -f $rep)
     Write-Host '=================================================================='
     return
@@ -263,6 +263,41 @@ if ($ListCatalog) {
         @($catalog | Where-Object { $_.Risk -eq 'safe' }).Count,
         @($catalog | Where-Object { $_.Risk -eq 'moderate' }).Count,
         @($catalog | Where-Object { $_.Risk -eq 'aggressive' }).Count)
+
+    # The window's "cleanup list" page shows a real table, so the catalogue is also
+    # written as a report instead of being scraped out of stdout: a text scraper in the
+    # GUI can silently drift from what the script actually targets, a report cannot.
+    # Array values are joined on purpose - ConvertTo-Json turns a one-element array into
+    # a bare string, which would make the consumer's column types inconsistent.
+    $catRows = foreach ($e in $catalog) {
+        New-Object psobject -Property ([ordered]@{
+            Id            = $e.Id
+            Group         = $e.Group
+            Risk          = $e.Risk
+            Mode          = $e.Mode
+            MinAgeDays    = $e.MinAgeDays
+            RequiresAdmin = [bool]$e.RequiresAdmin
+            Regenerates   = [bool]$e.Regenerates
+            ServiceStop   = ($e.ServiceStop -join ',')
+            Include       = ($e.Include -join ' ')
+            Path          = $e.Path
+            Note          = $e.Note
+        })
+    }
+    $catRep = Join-Path (New-ReportDir) 'catalog.json'
+    [ordered]@{
+        Title      = ("System cache cleanup catalogue (profile={0})" -f $Profile)
+        Time       = (Get-Date).ToString('o')
+        Mode       = 'read-only catalogue'
+        Profile    = $Profile
+        Total      = $catalog.Count
+        AdminCount = @($catalog | Where-Object { $_.RequiresAdmin }).Count
+        SafeCount  = @($catalog | Where-Object { $_.Risk -eq 'safe' }).Count
+        ModCount   = @($catalog | Where-Object { $_.Risk -eq 'moderate' }).Count
+        AggrCount  = @($catalog | Where-Object { $_.Risk -eq 'aggressive' }).Count
+        Targets    = @($catRows)
+    } | ConvertTo-Json -Depth 6 | ForEach-Object { $null = Write-ReportText -Path $catRep -Text $_ }
+    Write-Host ("   report -> {0}" -f $catRep)
     Write-Host '=================================================================='
     return
 }
@@ -347,7 +382,7 @@ try {
         # the guarantee: one negative step and the run stops
         if ($Execute -and $guard) {
             $regressed = Step-NetGainGuard -Label $entry.Id -AbortIfNegative:(-not $NoAbortOnRegression) `
-                                           -ToleranceMB $RegressionToleranceMB
+                                           -ToleranceMB $RegressionToleranceMB -RemovedItems $r.ItemsGone
             if ($regressed) {
                 Write-Warn2 ("free space fell during '{0}' - look for the row above with the negative net figure." -f $entry.Id)
             }
@@ -486,11 +521,19 @@ if (-not $Execute) {
         Write-Ok ("GUARANTEE HELD: C: used space shrank by {0:N1} MB (free {1} GB -> {2} GB)." -f `
             (-1 * $ng.NetUsedMB), $ng.FreeStartGB, $ng.FreeEndGB)
     } elseif ($ng.Verdict -eq 'NEUTRAL') {
-        Write-Warn2 'C: free space did not change: nothing selected could actually be reclaimed.'
-        Write-Warn2 'Most likely shadow-storage copy-on-write. See 08-Diagnose-SpaceGrowth.ps1.'
+        Write-Warn2 ("C: free space moved {0:N1} MB - inside this volume's noise floor (about {1:N0} MB)." -f `
+            $ng.NetFreeMB, $ng.NoiseFloorMB)
+        Write-Warn2 'Defender, telemetry and browsers move that much on their own, so this run'
+        Write-Warn2 'freed nothing measurable. Check the "removed / locked" columns above.'
     } else {
-        Write-Err2 ("GUARANTEE BROKEN: C: used space GREW by {0:N1} MB." -f $ng.NetUsedMB)
-        Write-Err2 'The run reports which target went backwards; the guard stopped work on the first one.'
+        Write-Err2 ("GUARANTEE BROKEN: C: used space GREW by {0:N1} MB (noise floor ~{1:N0} MB)." -f `
+            $ng.NetUsedMB, $ng.NoiseFloorMB)
+        if ($ng.Aborted) {
+            Write-Err2 ('The guard stopped work on the first target that went backwards: ' + $ng.AbortReason)
+        } else {
+            Write-Err2 'Some target freed less than background writers took; no single step was'
+            Write-Err2 'attributable to the deletions, so work was not stopped.'
+        }
         Write-Err2 'Run 08-Diagnose-SpaceGrowth.ps1 to attribute it (shadow copies vs. concurrent writers).'
     }
 }

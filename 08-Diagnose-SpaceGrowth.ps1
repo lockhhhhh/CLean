@@ -306,6 +306,6 @@ $report = [ordered]@{
     Findings    = @($findings)
 }
 $rep = Join-Path (New-ReportDir) ("{0}.json" -f $Tag)
-$report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $rep -Encoding UTF8
+$report | ConvertTo-Json -Depth 6 | ForEach-Object { $null = Write-ReportText -Path $rep -Text $_ }
 Write-Host ("   report -> {0}" -f $rep)
 Write-Host '=================================================================='
