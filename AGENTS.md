@@ -34,6 +34,10 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 `src/UpdateCheck.cs`（向 GitHub Releases API 问「有没有新版本」）**两个外壳共用**，改动它等于同时改两边。
 
+`assets/CLean.ico` 是**唯一**图标来源：`src/Build.ps1` 用 `/win32icon` 嵌进两个 EXE（编译末尾回读产物、
+在里面搜 256px 帧的原始字节，搜不到就构建失败），`installer/CLean.iss` 的 `SetupIconFile` 指向同一个文件。
+换图标只换这一个文件，别在别处再写一份路径。
+
 ## 安装包与发版
 
 ```powershell

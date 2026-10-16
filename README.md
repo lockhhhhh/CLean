@@ -57,8 +57,10 @@
 
 | 程序 | 界面 | 源码 | 体积 |
 |---|---|---|---|
-| `CLean.exe` | 控制台菜单 | `src\Launcher.cs` | 167 KB |
-| `CLean-GUI.exe` | **WinForms 窗口**（见 1.1；v0.3 颜色主题，v0.4 分页 + 内置扫描器，v0.5 每个功能独立动画，v1.1 只读页把 JSON 报告渲染成表格） | `src\GuiLauncher.cs` + `GuiPages.cs` + `GuiAnims.cs` + `ReportView.cs` | 279 KB |
+| `CLean.exe` | 控制台菜单 | `src\Launcher.cs` | 268 KB |
+| `CLean-GUI.exe` | **WinForms 窗口**（见 1.1；v0.3 颜色主题，v0.4 分页 + 内置扫描器，v0.5 每个功能独立动画，v1.1 只读页把 JSON 报告渲染成表格） | `src\GuiLauncher.cs` + `GuiPages.cs` + `GuiAnims.cs` + `ReportView.cs` | 389 KB |
+
+> 体积含内嵌的 11 个 `.ps1` 与程序图标（`assets\CLean.ico`，72,432 字节，9 个尺寸全带上）。
 
 > 版本号从 v1.0.0 起**统一**：以前两个外壳各自计版本（控制台 2.0 / 窗口版 0.5），现在由仓库根目录的
 > `VERSION` 文件统一定义，编译时注入两个程序的可执行文件、程序集元数据和安装包，三处不会跑偏。
@@ -449,6 +451,25 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 > `-OutputName` 里一旦出现非法字符就直接点明原因。
 
 `Build.ps1` 会自动收集项目根目录下**所有** `*.ps1` 并逐个校验是否成功内嵌，新增脚本无需改构建脚本。
+
+#### 程序图标也只有一个来源
+
+`assets\CLean.ico` 是唯一的图标文件：
+
+- `src\Build.ps1` 用 `/win32icon` 把它嵌进两个 EXE，嵌完**回读产物校验**：从 `.ico` 目录里取出最大那一帧
+  （256px），在编译产物里搜它的原始字节（csc 会把每帧原样写进 `RT_ICON` 资源），搜不到就直接构建失败 ——
+  「图标没生效」不可能悄悄溜过去；
+- `installer\CLean.iss` 的 `SetupIconFile` 指向同一个文件，于是 Setup.exe、卸载程序、开始菜单与桌面快捷方式
+  （快捷方式显示的是目标 EXE 的图标）四处一致 —— 已用 Inno Setup 6.7.3 实测：`dist\CLean-Setup-1.1.1.exe`
+  里读回来的图标同样是中心 `rgb(152,3,3)` 的那张红心，而不是 Inno 自带的图标；
+- `assets\CLean-icon-256.png`（透明底）与 `assets\CLean-icon-rounded-256.png`（白底圆角）是源素材，由一段
+  纯 Pillow 脚本从原图切出来（不用生成式模型；原图与脚本本身没入库，步骤记在这里，便于以后换图重做）：
+  **只把与画布边缘连通的近白像素判为背景**（所以翅膀内部的白被完整保留）→ 沿边界按黑描边反解 alpha
+  （缩小时不会出白边）→ 按 alpha 取主体 bbox 后四周留白 5.5% 居中 → 圆角半径取 256 的 22.37%（标准桌面图标圆角）。
+
+`src\Tests.ps1` 的第 8、9 节守着这条链：素材的尺寸 / 透明度 / 留白是否被改坏、`.ico` 是否还带着 16/32/48/256
+四个 shell 会点名的尺寸，以及**真的编译一遍**、再让 Windows 的 `ExtractAssociatedIcon` 把图标读回来
+（没有图标资源的 PE 拿到的是系统那个蓝色通用图标，中心读回红色才说明装进去的是我们这张图）。
 
 #### 项目缓存名单也只有一个来源（v1.1）
 

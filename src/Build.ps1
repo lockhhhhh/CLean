@@ -22,6 +22,11 @@
   script turns it into VersionInfo.cs (generated into the staging directory,
   never committed) and installer\CLean.iss reads the very same file.
 
+  assets\CLean.ico is the single source of the program icon: it is embedded here
+  with /win32icon (verified afterwards by looking for the 256px frame inside the
+  finished PE) and installer\CLean.iss points SetupIconFile at the very same file,
+  so the two EXEs, Setup.exe and every shortcut cannot disagree about the icon.
+
   Two targets share this build:
     (default)  Launcher.cs     -> console menu,  CLean.exe
     -Gui       GuiLauncher.cs  -> WinForms GUI,  CLean-GUI.exe
@@ -55,6 +60,68 @@ $version4  = $version + '.0'
 $product   = 'CLean'
 $publisher = 'lockhhhhh'
 $repoUrl   = 'https://github.com/lockhhhhh/CLean'
+
+# --- the one program icon --------------------------------------------------
+# Same rule as VERSION: exactly one file, read by this build AND by
+# installer\CLean.iss (SetupIconFile). It is copied into the ASCII staging
+# directory and referenced by that short ASCII name for the same code-page
+# reason as everything else passed to csc.
+$iconPath = Join-Path $root 'assets\CLean.ico'
+if (-not (Test-Path -LiteralPath $iconPath)) { throw ("icon not found: {0}" -f $iconPath) }
+$iconName = 'app.ico'
+
+# Two helpers for the icon self-check in step 5b. They live in this file rather than
+# in a module because Build.ps1 has no external dependency on purpose.
+function Get-IcoFrame {
+    # The largest frame of an .ico, as @{ Width = n; Bytes = byte[] }. Every directory
+    # entry is bounds-checked: a truncated .ico must fail the build with a readable
+    # message, not with an index-out-of-range from deep inside Array.Copy.
+    param([byte[]]$Bytes)
+    if ($Bytes.Length -lt 6 -or $Bytes[0] -ne 0 -or $Bytes[1] -ne 0 -or $Bytes[2] -ne 1 -or $Bytes[3] -ne 0) {
+        throw 'the icon is not an .ico file (bad ICONDIR header)'
+    }
+    $count = [BitConverter]::ToUInt16($Bytes, 4)
+    if ($count -lt 1 -or (6 + $count * 16) -gt $Bytes.Length) { throw 'the .ico declares no usable frame' }
+    $best = $null
+    $bestWidth = -1
+    for ($i = 0; $i -lt $count; $i++) {
+        $e = 6 + $i * 16
+        $w = [int]$Bytes[$e]
+        if ($w -eq 0) { $w = 256 }                 # 0 encodes 256 in an ICONDIR entry
+        $len = [BitConverter]::ToInt32($Bytes, $e + 8)
+        $off = [BitConverter]::ToInt32($Bytes, $e + 12)
+        if ($len -le 0 -or $off -lt 0 -or ($off + $len) -gt $Bytes.Length) {
+            throw ("the .ico is truncated (frame {0}: offset {1} + {2} bytes)" -f $i, $off, $len)
+        }
+        if ($w -gt $bestWidth) {
+            $bestWidth = $w
+            $frame = New-Object byte[] $len
+            [Array]::Copy($Bytes, $off, $frame, 0, $len)
+            $best = $frame
+        }
+    }
+    return @{ Width = $bestWidth; Bytes = $best }
+}
+
+function Find-ByteSequence {
+    # Offset of $Needle in $Haystack, or -1. [Array]::IndexOf scans at native speed and
+    # the byte-by-byte compare only runs where the first byte already matches, so hunting
+    # for a 40 KB frame inside a few hundred KB of PE is fast.
+    param([byte[]]$Haystack, [byte[]]$Needle)
+    $limit = $Haystack.Length - $Needle.Length
+    $i = 0
+    while ($i -le $limit) {
+        $j = [Array]::IndexOf($Haystack, $Needle[0], $i)
+        if ($j -lt 0 -or $j -gt $limit) { return -1 }
+        $hit = $true
+        for ($k = 1; $k -lt $Needle.Length; $k++) {
+            if ($Haystack[$j + $k] -ne $Needle[$k]) { $hit = $false; break }
+        }
+        if ($hit) { return $j }
+        $i = $j + 1
+    }
+    return -1
+}
 
 # The GUI target compiles GuiLauncher.cs as a windowed app; the default target
 # compiles Launcher.cs as a console app. Everything else is identical.
@@ -125,6 +192,7 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 try {
     Copy-Item -LiteralPath $srcFile                 -Destination $stage
     Copy-Item -LiteralPath (Join-Path $srcDir 'app.manifest') -Destination $stage
+    Copy-Item -LiteralPath $iconPath                -Destination (Join-Path $stage $iconName)
     foreach ($s in $scripts) { Copy-Item -LiteralPath $s.FullName -Destination $stage }
 
     # --- 3b. generate the version metadata for this build -----------------
@@ -164,6 +232,7 @@ internal static class VersionInfo
             '/optimize+'
             '/codepage:65001'
             '/win32manifest:app.manifest'
+            ('/win32icon:{0}' -f $iconName)
             ('/out:{0}' -f $stageExe)
         ))
 
@@ -269,6 +338,19 @@ internal static class VersionInfo
         throw ("baked-in assembly version is {0}, expected {1}" -f $asmVersion, $version4)
     }
 
+    # --- 5b. verify the icon really landed in the binary ------------------
+    # /win32icon takes a path and says nothing when the path is wrong or the frames are
+    # unusable, and a missing icon is easy to miss by eye. csc copies each frame of the
+    # .ico verbatim into an RT_ICON resource, so the exact byte image of the largest
+    # frame has to be somewhere in the PE - unless it is not.
+    $icoBytes = [System.IO.File]::ReadAllBytes($iconPath)
+    $frame    = Get-IcoFrame -Bytes $icoBytes
+    $exeBytes = [System.IO.File]::ReadAllBytes($stageOut)
+    $iconAt   = Find-ByteSequence -Haystack $exeBytes -Needle $frame.Bytes
+    if ($iconAt -lt 0) {
+        throw ("the {0}px icon frame is not in the compiled exe - /win32icon did not take effect" -f $frame.Width)
+    }
+
     # --- 6. publish under the real (possibly non-ASCII) name --------------
     Copy-Item -LiteralPath $stageOut -Destination $outPath -Force
 
@@ -278,6 +360,8 @@ internal static class VersionInfo
     Write-Host ("  output : {0}" -f $outPath)
     Write-Host ("  version: {0}  (assembly {1})" -f $version, $asmVersion)
     Write-Host ("  size   : {0:N0} bytes" -f (Get-Item -LiteralPath $outPath).Length)
+    Write-Host ("  icon   : {0}  ({1}px frame found at PE offset {2}, {3} frames total)" -f
+        (Split-Path -Leaf $iconPath), $frame.Width, $iconAt, ([BitConverter]::ToUInt16($icoBytes, 4)))
     Write-Host ("  embedded resources: {0} ({1} scripts verified)" -f $names.Count, $ps1.Count)
     foreach ($n in $ps1) { Write-Host ("      {0}" -f $n) }
     Write-Host '------------------------------------------------------------------'

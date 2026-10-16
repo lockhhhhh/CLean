@@ -160,6 +160,112 @@ foreach ($f in $targets) {
 }
 Check 'every script is pure ASCII and LF-only' ($bad.Count -eq 0) ($bad -join '; ')
 
+Write-Host '=== 8. program icon: the assets themselves ==='
+Add-Type -AssemblyName System.Drawing
+
+function Get-AlphaBounds {
+    # Margins between the drawn pixels (alpha > 8) and each edge of the image. LockBits
+    # rather than 65k GetPixel calls, which in PowerShell would dominate the suite.
+    param([string]$Path)
+    $bmp = [System.Drawing.Bitmap]::FromFile($Path)
+    try {
+        $w = $bmp.Width; $h = $bmp.Height
+        $rect = New-Object System.Drawing.Rectangle 0, 0, $w, $h
+        $data = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly,
+            [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        try {
+            $stride = $data.Stride
+            $buf = New-Object byte[] ($stride * $h)
+            [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $buf, 0, $buf.Length)
+        } finally { $bmp.UnlockBits($data) }
+        $l = $w; $r = -1; $t = $h; $b = -1
+        for ($y = 0; $y -lt $h; $y++) {
+            $row = $y * $stride
+            for ($x = 0; $x -lt $w; $x++) {
+                if ($buf[$row + $x * 4 + 3] -gt 8) {
+                    if ($x -lt $l) { $l = $x }
+                    if ($x -gt $r) { $r = $x }
+                    if ($y -lt $t) { $t = $y }
+                    if ($y -gt $b) { $b = $y }
+                }
+            }
+        }
+        return @{ Left = $l; Right = ($w - 1 - $r); Top = $t; Bottom = ($h - 1 - $b) }
+    } finally { $bmp.Dispose() }
+}
+
+$icoPath      = Join-Path $repo 'assets\CLean.ico'
+$iconPng      = Join-Path $repo 'assets\CLean-icon-256.png'
+$iconPngRound = Join-Path $repo 'assets\CLean-icon-rounded-256.png'
+Check 'the three icon files are in the repo' ((Test-Path $icoPath) -and (Test-Path $iconPng) -and (Test-Path $iconPngRound))
+
+# Windows picks a frame per size: 16 = tree/list, 32 = desktop, 48 = medium icons,
+# 256 = extra large + the shell's jumbo view. Drop any of those and the shell starts
+# rescaling (blurry) instead of picking the frame drawn for that size.
+$icoSizes = @()
+if (Test-Path $icoPath) {
+    $icoBytes = [System.IO.File]::ReadAllBytes($icoPath)
+    $icoCount = [BitConverter]::ToUInt16($icoBytes, 4)
+    for ($i = 0; $i -lt $icoCount; $i++) {
+        $w = [int]$icoBytes[6 + $i * 16]
+        if ($w -eq 0) { $w = 256 }
+        $icoSizes += $w
+    }
+}
+$needSizes = @(16, 32, 48, 256)
+$goneSizes = @($needSizes | Where-Object { $icoSizes -notcontains $_ })
+Check 'the ico carries every size the shell asks for' ($goneSizes.Count -eq 0) "(has: $($icoSizes -join ','))"
+Check 'the ico tops out at 256px' (($icoSizes | Measure-Object -Maximum).Maximum -eq 256) "(has: $($icoSizes -join ','))"
+
+$pngImg = [System.Drawing.Bitmap]::FromFile($iconPng)
+try {
+    Check 'the icon png is 256x256' (($pngImg.Width -eq 256) -and ($pngImg.Height -eq 256)) "($($pngImg.Width)x$($pngImg.Height))"
+    Check 'the icon png really has an alpha channel' ($pngImg.PixelFormat -eq [System.Drawing.Imaging.PixelFormat]::Format32bppArgb) "($($pngImg.PixelFormat))"
+    Check 'the icon png corners are fully transparent' (($pngImg.GetPixel(0, 0).A -eq 0) -and ($pngImg.GetPixel(255, 0).A -eq 0) -and
+        ($pngImg.GetPixel(0, 255).A -eq 0) -and ($pngImg.GetPixel(255, 255).A -eq 0))
+    Check 'the icon png centre is opaque' ($pngImg.GetPixel(128, 128).A -eq 255)
+} finally { $pngImg.Dispose() }
+
+$eb = Get-AlphaBounds $iconPng
+Check 'the artwork clears all four edges (nothing got cropped)' (($eb.Left -ge 4) -and ($eb.Right -ge 4) -and ($eb.Top -ge 4) -and ($eb.Bottom -ge 4)) "(L=$($eb.Left) R=$($eb.Right) T=$($eb.Top) B=$($eb.Bottom))"
+Check 'the artwork is centred (opposite margins within 4px)' (([Math]::Abs($eb.Left - $eb.Right) -le 4) -and ([Math]::Abs($eb.Top - $eb.Bottom) -le 4)) "(L=$($eb.Left) R=$($eb.Right) T=$($eb.Top) B=$($eb.Bottom))"
+
+$rb = [System.Drawing.Bitmap]::FromFile($iconPngRound)
+try {
+    Check 'the rounded variant has transparent corners' (($rb.GetPixel(0, 0).A -eq 0) -and ($rb.GetPixel(255, 255).A -eq 0))
+    Check 'the rounded variant still covers the edge midpoints' (($rb.GetPixel(0, 128).A -eq 255) -and ($rb.GetPixel(128, 0).A -eq 255))
+} finally { $rb.Dispose() }
+
+# The icon must reach the users through ONE file: Build.ps1 embeds it, CLean.iss points
+# SetupIconFile at it. A second hard-coded path is how the two would drift apart.
+$buildSrc = Get-Content (Join-Path $repo 'src\Build.ps1') -Raw
+$issSrc = Get-Content (Join-Path $repo 'installer\CLean.iss') -Raw
+Check 'Build.ps1 embeds the icon with /win32icon' ($buildSrc -match '/win32icon') 
+Check 'Build.ps1 reads assets\CLean.ico' ($buildSrc -match 'assets\\CLean\.ico')
+Check 'CLean.iss uses the same file for Setup' ($issSrc -match 'SetupIconFile=\.\.\\assets\\CLean\.ico')
+
+Write-Host '=== 9. the compiled exe carries that icon (ask Windows, not the bytes) ==='
+# "The build script looks right" is not evidence, so compile the console target and let
+# Windows read the icon back out of the PE. A PE with no icon resources hands out the
+# generic blue Windows icon (rgb 13,125,204 as measured here); a red centre can only
+# come from our own artwork.
+$probeExe = Join-Path $repo 'CLean-test-icon.exe'
+Remove-Item $probeExe -Force -EA SilentlyContinue
+$buildOk = $true
+$buildErr = ''
+try { & (Join-Path $repo 'src\Build.ps1') -OutputName 'CLean-test-icon.exe' | Out-Null }
+catch { $buildOk = $false; $buildErr = $_.Exception.Message }
+Check 'Build.ps1 compiles the console target' $buildOk $buildErr
+if ($buildOk) {
+    $exeIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($probeExe)
+    Check 'the exe carries an icon resource' ($exeIcon -ne $null)
+    if ($exeIcon) {
+        $px = $exeIcon.ToBitmap().GetPixel(16, 16)
+        Check 'the exe icon is our artwork, not the Windows default' (($px.R -gt 100) -and ($px.G -lt 70) -and ($px.B -lt 70)) "(rgb=$($px.R),$($px.G),$($px.B))"
+    }
+}
+Remove-Item $probeExe -Force -EA SilentlyContinue
+
 Remove-Item $root -Recurse -Force -EA SilentlyContinue
 
 Write-Host ''

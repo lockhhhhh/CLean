@@ -57,6 +57,10 @@ CloseApplications=yes
 RestartApplications=no
 UninstallDisplayIcon={app}\CLean-GUI.exe
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
+; 程序图标：与 src\Build.ps1 用 /win32icon 嵌进两个 EXE 的是同一个文件
+; （所以只改那一处，Setup.exe、卸载程序和所有快捷方式的图标一起变）。
+; 这个 .ico 的 256px 帧是 PNG 压缩的，Inno Setup 6 支持。
+SetupIconFile=..\assets\CLean.ico
 WizardStyle=modern
 ; Version resource of Setup.exe itself, so the Windows Properties tab (and any
 ; security software) sees a real version instead of 0.0.0.0. The trailing .0
